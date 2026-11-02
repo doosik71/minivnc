@@ -1,7 +1,8 @@
 //! MiniVNC server.
 //!
-//! Options follow TurboVNC's `Xvnc` where one exists. Until X11 capture
-//! lands (M3) the screen comes from a built-in test source (`-source`).
+//! Options follow TurboVNC's `Xvnc` where one exists. On Linux the screen
+//! of an existing X display is shared; built-in test sources (`-source`)
+//! work everywhere.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -11,30 +12,44 @@ use std::time::Duration;
 use rfb_auth::Passwords;
 use rfb_proto::consts::{SEC_TYPE_NONE, SEC_TYPE_VNC_AUTH};
 use rfb_server::source::{PngSource, SyntheticSource};
-use rfb_server::{Config, Server};
+use rfb_server::{Config, Server, Sharing};
 use tokio::net::TcpListener;
 use tracing::info;
 
 const USAGE: &str = "\
-usage: minivnc-server [:DISPLAY] [options]
+usage: minivnc-server [:N] [options]
 
-  :DISPLAY              listen on port 5900 + DISPLAY (default :0)
+  :N                    listen on port 5900 + N (default :0)
   -rfbport PORT         listen on PORT instead
   -localhost            accept connections from this host only
   -rfbauth FILE         VNC password file (see minivnc-passwd)
   -securitytypes LIST   comma-separated, in order of preference:
                         VNC, None (default: VNC)
   -desktop NAME         desktop name (default: MiniVNC)
-  -source SOURCE        pattern      moving test pattern (default)
+  -display DISPLAY      X display to share (default: $DISPLAY; Linux only)
+  -source SOURCE        x11          the X display (default on Linux)
+                        pattern      moving test pattern (default elsewhere)
                         png:PATH     PNG file, or directory of PNGs shown
                                      one per second
   -geometry WxH         size of the test pattern (default 1024x768)
+  -deferupdate MS       collect changes for MS ms before sending (default 1)
+  -viewonly             ignore keyboard and pointer input from all viewers
+  -alwaysshared         treat every connection as shared
+  -nevershared          treat every connection as non-shared
+  -disconnect           a non-shared viewer disconnects the others
+  -dontdisconnect       a non-shared viewer is refused while others are
+                        connected (default)
+  -pointerlocktimeout MS
+                        how long a dragging viewer keeps the pointer from
+                        others (default 3000)
 
 Set RUST_LOG (e.g. RUST_LOG=debug) to change the log level.";
 
 enum Source {
     Pattern,
     Png(PathBuf),
+    /// X display name; `None` = `$DISPLAY`.
+    X11(Option<String>),
 }
 
 struct Options {
@@ -45,17 +60,36 @@ struct Options {
     desktop: String,
     source: Source,
     geometry: (u16, u16),
+    defer_update: Duration,
+    view_only: bool,
+    sharing: Sharing,
+    pointer_lock_timeout: Duration,
+}
+
+fn parse_ms(v: &str, name: &str) -> Result<Duration, String> {
+    v.parse()
+        .map(Duration::from_millis)
+        .map_err(|_| format!("bad {name} value {v}"))
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
+    let config = Config::default();
     let mut opts = Options {
         port: 5900,
         localhost: false,
         rfbauth: None,
         security_types: vec![SEC_TYPE_VNC_AUTH],
         desktop: "MiniVNC".into(),
-        source: Source::Pattern,
+        source: if cfg!(target_os = "linux") {
+            Source::X11(None)
+        } else {
+            Source::Pattern
+        },
         geometry: (1024, 768),
+        defer_update: config.defer_update,
+        view_only: false,
+        sharing: Sharing::default(),
+        pointer_lock_timeout: config.pointer_lock_timeout,
     };
     let mut display = None;
     let mut rfbport = None;
@@ -78,6 +112,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
                 let v = value(&arg)?;
                 opts.source = match v.split_once(':') {
                     _ if v.eq_ignore_ascii_case("pattern") => Source::Pattern,
+                    _ if v.eq_ignore_ascii_case("x11") => Source::X11(None),
                     Some((kind, path)) if kind.eq_ignore_ascii_case("png") => {
                         Source::Png(path.into())
                     }
@@ -92,6 +127,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
                     .filter(|&(w, h)| w >= 64 && h >= 64)
                     .ok_or_else(|| format!("bad geometry {v} (at least 64x64)"))?;
             }
+            "display" => opts.source = Source::X11(Some(value(&arg)?)),
+            "deferupdate" => opts.defer_update = parse_ms(&value(&arg)?, &arg)?,
+            "pointerlocktimeout" => opts.pointer_lock_timeout = parse_ms(&value(&arg)?, &arg)?,
+            "viewonly" => opts.view_only = true,
+            "alwaysshared" => opts.sharing.always_shared = true,
+            "nevershared" => opts.sharing.never_shared = true,
+            "disconnect" => opts.sharing.disconnect = true,
+            "dontdisconnect" => opts.sharing.disconnect = false,
             "h" | "help" => return Err(String::new()),
             _ => return Err(format!("unknown option {arg}")),
         }
@@ -167,15 +210,23 @@ async fn run(opts: Options) -> std::io::Result<()> {
         desktop_name: opts.desktop,
         security_types: opts.security_types,
         passwords,
+        defer_update: opts.defer_update,
+        view_only: opts.view_only,
+        sharing: opts.sharing,
+        pointer_lock_timeout: opts.pointer_lock_timeout,
     };
     let server = match opts.source {
         Source::Pattern => Server::start(
             config,
             SyntheticSource::new(opts.geometry.0, opts.geometry.1),
+            None,
         )?,
-        Source::Png(path) => {
-            Server::start(config, PngSource::open(&path, Duration::from_secs(1))?)?
-        }
+        Source::Png(path) => Server::start(
+            config,
+            PngSource::open(&path, Duration::from_secs(1))?,
+            None,
+        )?,
+        Source::X11(display) => start_x11(config, display.as_deref())?,
     };
 
     let ip = if opts.localhost {
@@ -186,6 +237,24 @@ async fn run(opts: Options) -> std::io::Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((ip, opts.port))).await?;
     info!("listening on {}", listener.local_addr()?);
     server.serve(listener).await
+}
+
+#[cfg(target_os = "linux")]
+fn start_x11(config: Config, display: Option<&str>) -> std::io::Result<Server> {
+    let (source, input) = capture_x11::open(display)?;
+    let name = display.map_or_else(
+        || std::env::var("DISPLAY").unwrap_or_default(),
+        str::to_string,
+    );
+    info!("sharing X display {name}");
+    Server::start(config, source, Some(Box::new(input)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_x11(_config: Config, _display: Option<&str>) -> std::io::Result<Server> {
+    Err(std::io::Error::other(
+        "X11 capture is only available on Linux; use -source pattern or png:PATH",
+    ))
 }
 
 #[cfg(test)]
@@ -228,6 +297,33 @@ mod tests {
         );
         assert_eq!(o.geometry, (800, 600));
         assert!(parse(&["-geometry", "10x10"]).is_err());
-        assert!(parse(&["-source", "x11"]).is_err());
+        assert!(parse(&["-source", "vnc"]).is_err());
+        assert!(
+            matches!(parse(&["-display", ":5"]).unwrap().source, Source::X11(Some(d)) if d == ":5")
+        );
+        assert!(matches!(
+            parse(&["-source", "x11"]).unwrap().source,
+            Source::X11(None)
+        ));
+    }
+
+    #[test]
+    fn turbovnc_session_options() {
+        let o = parse(&[
+            "-deferupdate",
+            "40",
+            "-viewonly",
+            "-disconnect",
+            "-pointerlocktimeout",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(o.defer_update, Duration::from_millis(40));
+        assert!(o.view_only && o.sharing.disconnect);
+        assert_eq!(o.pointer_lock_timeout, Duration::ZERO);
+        let o = parse(&["-disconnect", "-dontdisconnect", "-alwaysshared"]).unwrap();
+        assert!(!o.sharing.disconnect && o.sharing.always_shared);
+        assert_eq!(parse(&[]).unwrap().defer_update, Duration::from_millis(1));
+        assert!(parse(&["-deferupdate", "x"]).is_err());
     }
 }

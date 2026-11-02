@@ -1,0 +1,23 @@
+[package]
+name = "capture-x11"
+description = "X11 screen capture and input injection for the MiniVNC server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rfb-codec = { path = "../rfb-codec" }
+rfb-proto = { path = "../rfb-proto" }
+rfb-region = { path = "../rfb-region" }
+rfb-server = { path = "../rfb-server" }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"
+rustix = { version = "1.1.6", features = ["event"] }
+x11rb = { version = "0.14.0", features = ["shm", "damage", "xfixes", "xtest", "randr", "xkb"] }

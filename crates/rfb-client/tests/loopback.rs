@@ -2,16 +2,18 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rfb_auth::{Password, Passwords};
 use rfb_client::{Client, ClientError, ConnectOptions, Event};
 use rfb_codec::{Framebuffer, pack_rgb};
 use rfb_proto::consts::*;
+use rfb_proto::msg::ClientMessage;
 use rfb_proto::{PixelFormat, Rect};
 use rfb_region::Region;
 use rfb_server::source::{RGB888, SyntheticSource};
-use rfb_server::{Config, FrameSource, Server};
+use rfb_server::{Config, FrameSource, InputSink, Server, Sharing};
 
 const W: u16 = 200;
 const H: u16 = 120;
@@ -75,12 +77,21 @@ fn start(source: impl FrameSource, security_types: Vec<u8>) -> SocketAddr {
         desktop_name: "loopback".into(),
         security_types,
         passwords: Some(passwords()),
+        ..Config::default()
     };
+    start_with(source, config, None)
+}
+
+fn start_with(
+    source: impl FrameSource,
+    config: Config,
+    input: Option<Box<dyn InputSink>>,
+) -> SocketAddr {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let server = Server::start(config, source).unwrap();
+            let server = Server::start(config, source, input).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(listener.local_addr().unwrap()).unwrap();
             server.serve(listener).await.unwrap();
@@ -90,15 +101,228 @@ fn start(source: impl FrameSource, security_types: Vec<u8>) -> SocketAddr {
 }
 
 fn connect(addr: SocketAddr, password: Option<&[u8]>) -> Result<Client<TcpStream>, ClientError> {
+    connect_opts(addr, password, true)
+}
+
+fn connect_opts(
+    addr: SocketAddr,
+    password: Option<&[u8]>,
+    shared: bool,
+) -> Result<Client<TcpStream>, ClientError> {
     let stream = TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let options = ConnectOptions {
         password: password.map(Password::new),
-        shared: true,
+        shared,
     };
     Client::connect(stream, &options)
+}
+
+/// Records injected input.
+#[derive(Clone, Default)]
+struct Recorder(Arc<Mutex<Vec<String>>>);
+
+impl InputSink for Recorder {
+    fn key(&mut self, down: bool, keysym: u32) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("key {keysym:#x} {down}"));
+        Ok(())
+    }
+    fn pointer(&mut self, x: u16, y: u16, buttons: u16) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("pointer {x},{y} {buttons}"));
+        Ok(())
+    }
+    fn release_all_keys(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().push("release all".into());
+        Ok(())
+    }
+}
+
+impl Recorder {
+    /// Waits until `n` events have been recorded and returns them.
+    fn wait_for(&self, n: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let events = self.0.lock().unwrap().clone();
+            if events.len() >= n {
+                return events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.0.lock().unwrap().clone()
+    }
+}
+
+fn no_auth(config: Config) -> Config {
+    Config {
+        security_types: vec![SEC_TYPE_NONE],
+        ..config
+    }
+}
+
+fn key(client: &mut Client<TcpStream>, keysym: u32, down: bool) {
+    client
+        .send(&ClientMessage::KeyEvent { down, keysym })
+        .unwrap();
+}
+
+fn pointer(client: &mut Client<TcpStream>, x: u16, y: u16, buttons: u16) {
+    client
+        .send(&ClientMessage::PointerEvent { buttons, x, y })
+        .unwrap();
+}
+
+/// The server closes the connection: the next read fails.
+fn assert_closed(client: &mut Client<TcpStream>) {
+    match client.read_message() {
+        Err(ClientError::Io(e)) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ),
+            "{e}"
+        ),
+        other => panic!("expected a closed connection, got {other:?}"),
+    }
+}
+
+#[test]
+fn input_reaches_the_sink_unless_view_only() {
+    let rec = Recorder::default();
+    let addr = start_with(
+        Pattern,
+        no_auth(Config::default()),
+        Some(Box::new(rec.clone())),
+    );
+    let mut client = connect(addr, None).unwrap();
+    key(&mut client, 0x61, true);
+    key(&mut client, 0x61, false);
+    pointer(&mut client, 10, 20, 1);
+    assert_eq!(
+        rec.wait_for(4),
+        [
+            "release all",
+            "key 0x61 true",
+            "key 0x61 false",
+            "pointer 10,20 1"
+        ]
+    );
+
+    let rec = Recorder::default();
+    let config = Config {
+        view_only: true,
+        ..no_auth(Config::default())
+    };
+    let addr = start_with(Pattern, config, Some(Box::new(rec.clone())));
+    let mut client = connect(addr, None).unwrap();
+    key(&mut client, 0x61, true);
+    pointer(&mut client, 1, 1, 0);
+    // A full update round trip proves the events were processed.
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    next_update(&mut client);
+    assert_eq!(rec.wait_for(1), ["release all"]);
+}
+
+#[test]
+fn pointer_lock_follows_dragging_client() {
+    let rec = Recorder::default();
+    let addr = start_with(
+        Pattern,
+        no_auth(Config::default()),
+        Some(Box::new(rec.clone())),
+    );
+    let mut a = connect(addr, None).unwrap();
+    let mut b = connect(addr, None).unwrap();
+    let sync = |c: &mut Client<TcpStream>| {
+        c.request_update(false, Rect::new(0, 0, 1, 1)).unwrap();
+        next_update(c);
+    };
+    pointer(&mut a, 1, 1, 1); // A starts dragging
+    sync(&mut a);
+    pointer(&mut b, 2, 2, 0); // ignored
+    sync(&mut b);
+    pointer(&mut a, 3, 3, 0); // A releases
+    sync(&mut a);
+    pointer(&mut b, 4, 4, 0); // accepted
+    assert_eq!(
+        rec.wait_for(4),
+        [
+            "release all",
+            "pointer 1,1 1",
+            "pointer 3,3 0",
+            "pointer 4,4 0"
+        ]
+    );
+}
+
+#[test]
+fn non_shared_clients_follow_the_policy() {
+    // Default (TurboVNC -dontdisconnect): a second non-shared client is
+    // refused right after ServerInit.
+    let addr = start_with(Pattern, no_auth(Config::default()), None);
+    let mut first = connect_opts(addr, None, false).unwrap();
+    let mut second = connect_opts(addr, None, false).unwrap();
+    assert_closed(&mut second);
+    first.request_update(false, Rect::new(0, 0, 1, 1)).unwrap();
+    next_update(&mut first);
+
+    // -disconnect: the newcomer wins.
+    let config = Config {
+        sharing: Sharing {
+            disconnect: true,
+            ..Sharing::default()
+        },
+        ..no_auth(Config::default())
+    };
+    let addr = start_with(Pattern, config, None);
+    let mut first = connect_opts(addr, None, false).unwrap();
+    let mut second = connect_opts(addr, None, false).unwrap();
+    assert_closed(&mut first);
+    second.request_update(false, Rect::new(0, 0, 1, 1)).unwrap();
+    next_update(&mut second);
+
+    // -alwaysshared: both stay.
+    let config = Config {
+        sharing: Sharing {
+            always_shared: true,
+            ..Sharing::default()
+        },
+        ..no_auth(Config::default())
+    };
+    let addr = start_with(Pattern, config, None);
+    let mut first = connect_opts(addr, None, false).unwrap();
+    let mut second = connect_opts(addr, None, false).unwrap();
+    for c in [&mut first, &mut second] {
+        c.request_update(false, Rect::new(0, 0, 1, 1)).unwrap();
+        next_update(c);
+    }
+}
+
+#[test]
+fn updates_wait_for_the_defer_time() {
+    let config = Config {
+        defer_update: Duration::from_millis(500),
+        ..no_auth(Config::default())
+    };
+    let addr = start_with(SyntheticSource::new(320, 200), config, None);
+    let mut client = connect(addr, None).unwrap();
+    let all = Rect::new(0, 0, 320, 200);
+    client.request_update(false, all).unwrap();
+    next_update(&mut client);
+    // The square moves every 100 ms; the first change starts a 500 ms timer.
+    let start = std::time::Instant::now();
+    client.request_update(true, all).unwrap();
+    next_update(&mut client);
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
 }
 
 fn next_update(client: &mut Client<TcpStream>) -> Vec<Rect> {

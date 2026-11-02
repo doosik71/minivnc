@@ -7,7 +7,7 @@ TurboVNC의 강점을 Rust로 옮겨, 메모리 안전하고 배포하기 쉬운
 - 지연 업데이트와 혼잡 제어
 - 자동 무손실 갱신(ALR)
 
-> **상태:** M2(Tight 인코딩)를 마쳤습니다. 서버는 테스트용 화면(합성 패턴/PNG)을 TurboVNC 방식의 Tight(JPEG 포함) 또는 Raw로 제공합니다. TurboVNC 뷰어의 모든 화질 프리셋으로 접속할 수 있으며, 출력 크기는 TurboVNC와 ±5% 안입니다. 실제 화면 캡처(M3)와 뷰어 GUI(M4)는 아직 없습니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
+> **상태:** M3(X11 서버)를 마쳤습니다. Linux에서 기존 X 디스플레이(Xvfb, Xorg)를 TurboVNC 방식의 Tight(JPEG 포함) 또는 Raw로 공유하고, 키보드·마우스 입력을 XTest로 주입합니다. Xvfb + xfce4 세션을 TurboVNC Java 뷰어로 쓸 수 있습니다(타이핑, 창 이동, 동영상 재생). 커서 인코딩·화면 크기 변경(M5)과 뷰어 GUI(M4)는 아직 없습니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
 
 ---
 
@@ -71,21 +71,29 @@ minivnc/
 - Rust stable (1.88 이상)
 - C 컴파일러: zlib을 소스에서 정적 빌드합니다(Windows는 MSVC, Linux는 gcc/clang).
 - 선택: libjpeg-turbo JPEG 백엔드(`--features rfb-codec/turbojpeg`)를 쓰려면 CMake와 NASM이 필요합니다. 기본 JPEG 백엔드는 순수 Rust입니다.
-- (예정) Linux 서버 빌드: X11 개발 헤더(xcb, shm, damage, xfixes, xtest, randr), 필요하면 PAM
+- Linux X11 서버는 순수 Rust X 프로토콜 구현(x11rb)을 쓰므로 X11 개발 헤더가 필요 없습니다. X 서버에는 MIT-SHM(없으면 느린 GetImage 사용), DAMAGE, XTEST, XKEYBOARD 확장이 있어야 합니다.
 
 ```sh
 cargo build --release
 cargo build --release --workspace --features rfb-codec/turbojpeg   # libjpeg-turbo 사용
 ```
 
-## 현재 시험해 볼 수 있는 것 (M2)
+## 현재 시험해 볼 수 있는 것 (M3)
 
 ```sh
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
 echo secret12 | minivnc-passwd -f > passwd
 
-# 테스트 화면 서버: 움직이는 패턴 또는 PNG 파일/디렉터리, 포트 5902
-minivnc-server :2 -rfbauth passwd -geometry 800x600
+# Linux: Xvfb + xfce4 세션을 공유, 포트 5901
+# (WSLg에서는 GTK 앱이 Wayland로 가지 않도록 WAYLAND_DISPLAY를 지운다)
+Xvfb :1 -screen 0 1920x1080x24 &
+env -u WAYLAND_DISPLAY DISPLAY=:1 dbus-launch --exit-with-session startxfce4 &
+minivnc-server :1 -display :1 -rfbauth passwd
+# 그 밖의 옵션: -deferupdate MS, -viewonly, -localhost, -securitytypes none,
+#   -alwaysshared / -nevershared / -disconnect, -pointerlocktimeout MS
+
+# 테스트 화면 서버(모든 플랫폼): 움직이는 패턴 또는 PNG 파일/디렉터리, 포트 5902
+minivnc-server :2 -rfbauth passwd -source pattern -geometry 800x600
 minivnc-server :2 -rfbauth passwd -source png:shots/
 
 # 아무 VNC 서버에 접속해 화면을 PNG로 저장하고 받은 바이트 수를 출력

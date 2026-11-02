@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+capture-x11 = { path = "../../crates/capture-x11" }
 rfb-auth = { path = "../../crates/rfb-auth" }
 rfb-proto = { path = "../../crates/rfb-proto" }
 rfb-server = { path = "../../crates/rfb-server" }

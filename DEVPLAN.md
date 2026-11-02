@@ -579,17 +579,26 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - **출력 크기**(MiniVNC / TurboVNC 3.3.1): 순수 Rust JPEG에서 0.989~1.052, `turbojpeg`에서 0.989~1.022였다.
 
 ### M3. 실제 화면 서버 — X11 (2주)
-- [ ] `capture-x11`
-  - XShm 캡처, XDamage 손상 영역, RandR 지오메트리
-  - XFixes 커서
+- [x] `capture-x11`
+  - XShm 캡처(없으면 GetImage), XDamage 손상 영역(DELTA_RECTANGLES + Subtract)
+  - 지오메트리는 연결 시 루트 창 크기로 정한다. RandR 크기 변경은 DesktopSize와 함께 M5에서 한다.
+  - XFixes 커서: 클라이언트 커서 인코딩이 M5라서 지금은 커서 이미지를 프레임버퍼에 합성한다(포인터 위치 10ms 폴링).
   - XTest 입력과 keysym→keycode 변환(`input-xkb.c` 로직: Shift/Level3 보정, 동적 keysym 할당, 눌린 키 추적)
-- [ ] **업데이트 스케줄러**
-  - modified/requested 영역 관리, 지연 업데이트(기본 1~40ms 설정)
+    - 키맵 로직(`keymap.rs`)은 플랫폼 독립이라 Windows에서도 모의 키맵으로 테스트한다.
+    - X 서버 밖에서 동작하므로 원본과 다른 점이 있다. XTest 입력 뒤 코어 키보드의 `lookup_mods`가 갱신되지 않아(Xvfb에서 확인) 유효 수정자(`mods`)를 쓴다.
+  - x11rb(순수 Rust)는 Linux 추상 소켓에 접속하지 않으므로 직접 시도한다. WSLg처럼 `/tmp/.X11-unix`가 읽기 전용이면 Xvfb는 추상 소켓만 연다.
+- [x] **업데이트 스케줄러**
+  - modified/requested 영역 관리, 지연 업데이트(`-deferupdate`, 기본 1ms: `vncserver` 스크립트 값)
   - 100개 초과 사각형 병합
   - non-incremental 요청 처리
-- [ ] 다중 클라이언트: shared/exclusive 정책(`-alwaysshared`, `-nevershared`, `-disconnect`), 포인터 잠금
-- [ ] `minivnc-server` CLI: `-rfbport`, `-rfbauth`, `-securitytypes`, `-deferupdate`, `-localhost`, `-viewonly`, `-display`
+- [x] 다중 클라이언트: shared/exclusive 정책(`-alwaysshared`, `-nevershared`, `-disconnect`/`-dontdisconnect`), 포인터 잠금(`-pointerlocktimeout`, 기본 3000ms), 첫 클라이언트 접속 시 눌린 키 해제
+- [x] `minivnc-server` CLI: `-rfbport`, `-rfbauth`, `-securitytypes`, `-deferupdate`, `-localhost`, `-viewonly`, `-display`
 - **DoD:** Xvfb + xfce4 세션을 Java 뷰어로 일상적으로 쓸 수 있다(타이핑, 창 이동, 동영상 재생).
+- **검증 기록 (2026-11-02)**
+  - 환경: WSL Ubuntu 26.04, Xvfb 1280x800x24 + xfce4, Windows의 TurboVNC Java 뷰어(Tight + JPEG Q95 1X CL1). 입력은 시험용 RFB 클라이언트로 KeyEvent/PointerEvent를 보내고 결과를 뷰어 창 캡처와 터미널 출력으로 확인했다.
+  - **타이핑**: 터미널에 입력한 문자열이 파일로 그대로 기록됐다. 출력 가능한 ASCII 전체에 대해 Shift를 보내는 경우(뷰어 방식)와 보내지 않는 경우 모두 맞았고, `é ü ß æ ñ €`는 동적 keysym 할당으로 입력됐다. Ctrl+D 같은 수정자 조합과 명령 실행도 정상이었다.
+  - **창 이동**: 제목 표시줄을 끌어 창을 옮겼고, 남는 흔적 없이 다시 그려졌다.
+  - **동영상**: mpv(640x360, 30fps 시험 영상, `--vo=x11`) 재생 중 클라이언트가 초당 23.5개 업데이트(1.2MB/s)를 받았다. 이때 서버 CPU 사용률은 약 17%였다.
 
 ### M4. MiniVNC 뷰어 MVP (3주)
 - [ ] `winit` + `softbuffer` 창, 손상 영역 블릿, 창 크기 = 원격 크기, 스크롤

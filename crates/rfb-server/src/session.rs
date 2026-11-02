@@ -16,12 +16,13 @@ use rfb_proto::{Parsed, ProtoError, Rect};
 use rfb_region::Region;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, trace};
 
-use crate::Shared;
 use crate::encodings::EncodingPrefs;
 use crate::source::{to_region_rect, to_wire_rect};
+use crate::{InputEvent, Shared};
 
 /// TurboVNC `rfbCombineRect`: send the bounding box instead of more
 /// rectangles than this.
@@ -30,13 +31,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// TurboVNC truncates desktop names to this length.
 const MAX_DESKTOP_NAME: usize = 128;
 
-pub(crate) async fn run(stream: TcpStream, shared: Arc<Shared>, id: u64) {
+pub(crate) async fn run(stream: TcpStream, shared: Arc<Shared>, id: u64, kick: Arc<Notify>) {
     let mut conn = Conn::new(stream);
     let result = async {
-        let access = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut conn, &shared, id))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
-        Session::new(conn, &shared, id, access)?.run().await
+        let (access, wants_shared) =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut conn, &shared, id))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
+        // As in TurboVNC, the sharing policy is applied after ServerInit.
+        if !shared.admit(id, wants_shared) {
+            return Ok(());
+        }
+        Session::new(conn, &shared, id, access)?.run(&kick).await
     }
     .await;
     match result {
@@ -109,7 +115,8 @@ impl Conn {
 }
 
 /// Runs version and security negotiation, then the initialisation messages.
-async fn handshake(conn: &mut Conn, shared: &Shared, id: u64) -> io::Result<Access> {
+/// Returns the access granted and whether the client asked to share.
+async fn handshake(conn: &mut Conn, shared: &Shared, id: u64) -> io::Result<(Access, bool)> {
     let config = &shared.config;
     conn.write(&Version::V3_8.to_bytes()).await?;
     let asked = conn.parse(Version::parse).await?;
@@ -200,7 +207,7 @@ async fn handshake(conn: &mut Conn, shared: &Shared, id: u64) -> io::Result<Acce
     let mut out = Vec::new();
     server_init.write(&mut out);
     conn.write(&out).await?;
-    Ok(access)
+    Ok((access, init.shared))
 }
 
 struct Session<'a> {
@@ -210,6 +217,8 @@ struct Session<'a> {
     access: Access,
     translator: Translator,
     prefs: EncodingPrefs,
+    /// When the deferred update collecting changes is due.
+    defer_deadline: Option<tokio::time::Instant>,
     tight: TightEncoder,
     /// Changed areas not yet sent.
     modified: Region,
@@ -230,6 +239,7 @@ impl<'a> Session<'a> {
             access,
             translator,
             prefs: EncodingPrefs::default(),
+            defer_deadline: None,
             tight: TightEncoder::new(),
             modified: Region::new(),
             requested: Region::new(),
@@ -237,23 +247,54 @@ impl<'a> Session<'a> {
         })
     }
 
-    async fn run(mut self) -> io::Result<()> {
+    async fn run(mut self, kick: &Notify) -> io::Result<()> {
         let mut damage = self.shared.damage.subscribe();
         let ctx = ClientParseCtx::default();
         loop {
             while let Some(msg) = self.conn.try_parse(|b| ClientMessage::parse(b, &ctx))? {
                 self.handle(msg).await?;
             }
-            self.send_update().await?;
+            let deadline = self.defer_deadline;
+            let timer = async move {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 r = self.conn.fill() => r?,
-                d = damage.recv() => match d {
-                    Ok(region) => self.modified = self.modified.union(&region),
-                    Err(RecvError::Lagged(_)) => self.modified = self.bounds.clone(),
-                    Err(RecvError::Closed) => return Ok(()),
-                },
+                d = damage.recv() => {
+                    match d {
+                        Ok(region) => self.modified = self.modified.union(&region),
+                        Err(RecvError::Lagged(_)) => self.modified = self.bounds.clone(),
+                        Err(RecvError::Closed) => return Ok(()),
+                    }
+                    self.schedule_update().await?;
+                }
+                () = timer => {
+                    self.defer_deadline = None;
+                    self.send_update().await?;
+                }
+                () = kick.notified() => {
+                    info!(client = self.id, "disconnected by a non-shared client");
+                    return Ok(());
+                }
             }
         }
+    }
+
+    /// TurboVNC `rfbScheduleDeferredUpdate`: start collecting changes for
+    /// `defer_update` before sending.
+    async fn schedule_update(&mut self) -> io::Result<()> {
+        if self.modified.is_empty() || self.defer_deadline.is_some() {
+            return Ok(());
+        }
+        let defer = self.shared.config.defer_update;
+        if defer.is_zero() {
+            return self.send_update().await;
+        }
+        self.defer_deadline = Some(tokio::time::Instant::now() + defer);
+        Ok(())
     }
 
     async fn handle(&mut self, msg: ClientMessage) -> io::Result<()> {
@@ -294,25 +335,27 @@ impl<'a> Session<'a> {
                     self.modified = self.modified.union(&r);
                 }
                 self.requested = self.requested.union(&r);
+                // Send now unless a deferred update is still collecting.
+                let collecting = self
+                    .defer_deadline
+                    .is_some_and(|d| tokio::time::Instant::now() < d);
+                if !self.modified.is_empty() && !collecting {
+                    self.defer_deadline = None;
+                    self.send_update().await?;
+                }
             }
             ClientMessage::KeyEvent { down, keysym } => {
-                trace!(
-                    client = self.id,
-                    down,
-                    keysym,
-                    view_only = self.view_only(),
-                    "key event"
-                );
+                trace!(client = self.id, down, keysym, "key event");
+                if !self.view_only() {
+                    self.shared.send_input(InputEvent::Key { down, keysym });
+                }
             }
             ClientMessage::PointerEvent { buttons, x, y } => {
-                trace!(
-                    client = self.id,
-                    buttons,
-                    x,
-                    y,
-                    view_only = self.view_only(),
-                    "pointer event"
-                );
+                trace!(client = self.id, buttons, x, y, "pointer event");
+                if !self.view_only() && self.shared.take_pointer(self.id, buttons) {
+                    self.shared
+                        .send_input(InputEvent::Pointer { x, y, buttons });
+                }
             }
             ClientMessage::ClientCutText(_) => {
                 debug!(client = self.id, "ignoring clipboard update");
@@ -325,7 +368,7 @@ impl<'a> Session<'a> {
     }
 
     fn view_only(&self) -> bool {
-        self.access == Access::ViewOnly
+        self.shared.config.view_only || self.access == Access::ViewOnly
     }
 
     /// Sends `modified ∩ requested` if the client is waiting for it.
