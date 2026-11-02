@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rfb_auth::Access;
+use rfb_codec::tight::TightEncoder;
 use rfb_codec::{Translator, raw};
 use rfb_proto::consts::*;
 use rfb_proto::handshake::{ClientInit, SecurityOffer, SecurityResult, ServerInit, Version};
 use rfb_proto::msg::{
-    ClientMessage, ClientParseCtx, ServerMessage, write_framebuffer_update_header,
+    ClientMessage, ClientParseCtx, RectHeader, ServerMessage, write_framebuffer_update_header,
 };
-use rfb_proto::{Parsed, ProtoError};
+use rfb_proto::{Parsed, ProtoError, Rect};
 use rfb_region::Region;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -19,6 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, trace};
 
 use crate::Shared;
+use crate::encodings::EncodingPrefs;
 use crate::source::{to_region_rect, to_wire_rect};
 
 /// TurboVNC `rfbCombineRect`: send the bounding box instead of more
@@ -207,6 +209,8 @@ struct Session<'a> {
     id: u64,
     access: Access,
     translator: Translator,
+    prefs: EncodingPrefs,
+    tight: TightEncoder,
     /// Changed areas not yet sent.
     modified: Region,
     /// Areas the client asked for and has not received yet.
@@ -225,6 +229,8 @@ impl<'a> Session<'a> {
             id,
             access,
             translator,
+            prefs: EncodingPrefs::default(),
+            tight: TightEncoder::new(),
             modified: Region::new(),
             requested: Region::new(),
             bounds,
@@ -279,8 +285,8 @@ impl<'a> Session<'a> {
                 ));
             }
             ClientMessage::SetEncodings(encodings) => {
-                // Only Raw is implemented so far, and every client accepts it.
-                debug!(client = self.id, ?encodings, "encodings set");
+                self.prefs.apply(&encodings);
+                debug!(client = self.id, ?encodings, prefs = ?self.prefs, "encodings set");
             }
             ClientMessage::FramebufferUpdateRequest { incremental, rect } => {
                 let r = Region::from(to_region_rect(rect)).intersect(&self.bounds);
@@ -335,15 +341,44 @@ impl<'a> Session<'a> {
         self.requested = Region::new();
         update.collapse_if_over(COMBINE_RECT);
 
+        let rects: Vec<Rect> = update.rects().iter().map(to_wire_rect).collect();
+        let tight = self.prefs.preferred == ENCODING_TIGHT;
+        // Tight may split rectangles; if the count is not known up front,
+        // TurboVNC sends 0xFFFF and ends the update with LastRect.
+        let count: Option<u32> = if tight {
+            rects
+                .iter()
+                .map(|&r| TightEncoder::num_rects(&self.prefs.tight, r))
+                .sum()
+        } else {
+            Some(rects.len() as u32)
+        };
+        let num_rects = match count.map(u16::try_from) {
+            Some(Ok(n)) if n != 0xFFFF => n,
+            _ if self.prefs.tight.last_rect => 0xFFFF,
+            _ => return Err(io::Error::other("update has too many rectangles")),
+        };
+
         let mut out = Vec::new();
         {
             let fb = self.shared.fb.read().unwrap_or_else(|e| e.into_inner());
-            let n = u16::try_from(update.num_rects()).expect("at most COMBINE_RECT rectangles");
-            write_framebuffer_update_header(&mut out, n);
-            for r in update.rects() {
-                raw::encode(&fb, to_wire_rect(r), &self.translator, &mut out)
-                    .map_err(io::Error::other)?;
+            write_framebuffer_update_header(&mut out, num_rects);
+            for &r in &rects {
+                if tight {
+                    self.tight
+                        .encode(&fb, r, &self.translator, &self.prefs.tight, &mut out)
+                } else {
+                    raw::encode(&fb, r, &self.translator, &mut out)
+                }
+                .map_err(io::Error::other)?;
             }
+        }
+        if num_rects == 0xFFFF {
+            RectHeader {
+                rect: Rect::default(),
+                encoding: ENCODING_LAST_RECT,
+            }
+            .write(&mut out);
         }
         trace!(
             client = self.id,

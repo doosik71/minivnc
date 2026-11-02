@@ -478,8 +478,8 @@ pub trait InputSink {
 | ----------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | 비동기 I/O (서버) | `tokio`                                                                | 클라이언트 다수, 타이머(defer/ALR/congestion)를 자연스럽게 처리한다. 인코딩은 `spawn_blocking` 또는 `rayon`으로 돌린다. |
 | I/O (뷰어)        | 표준 blocking 스레드                                                   | 원본 구조와 같고 단순하다.                                                                                              |
-| zlib              | `flate2` (`zlib-rs` 또는 `zlib` 백엔드)                                | 영구 `Compress`, `FlushCompress::Sync`, `set_level`이 필요하다. **zlib 호환 출력이 필수다.**                            |
-| JPEG              | `turbojpeg` 크레이트 (libjpeg-turbo)                                   | 4:4:4/4:2:2/4:2:0/Gray를 지원하고 성능이 TurboVNC와 같다. 대안은 순수 Rust 백엔드(feature)다.                           |
+| zlib              | 압축: C zlib(`libz-sys` 정적 빌드) 직접 래핑, 해제: `flate2`          | 영구 스트림, `Z_SYNC_FLUSH`, `deflateParams`가 필요하다. flate2의 `set_level`은 이 용도로 동작하지 않는다(M2 참고). |
+| JPEG              | 기본 `jpeg-encoder`/`zune-jpeg`(순수 Rust), feature `turbojpeg`         | 빌드 의존성 없이 동작한다. libjpeg-turbo는 TurboVNC와 같은 출력을 내며, CMake와 NASM이 필요하다.                       |
 | DES               | `des` 크레이트                                                         | VNC 키 비트 반전을 직접 처리해야 한다.                                                                                  |
 | TLS               | `rustls` (X509*) + `openssl` feature (TLSNone/TLSVnc/TLSPlain 익명 DH) | rustls는 익명 DH(aNULL)를 지원하지 않는다. 따라서 익명 TLS는 openssl feature로만 제공한다.                              |
 | X11               | `x11rb` (shm, damage, xfixes, xtest, randr, xkb)                       | 순수 Rust이고 확장을 모두 지원한다.                                                                                     |
@@ -541,11 +541,11 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - GitHub에 3.3.2 릴리스 패키지가 없어 Xvnc는 3.3.1을 썼다. sudo 없이 `.deb`를 풀어 실행했고, `xkbcomp`는 `-xkbcompdir`로 지정했다.
 
 ### M2. Tight 인코딩 (3주) — 핵심
-- [ ] **디코더** (먼저 만들어 인코더 검증에 쓴다)
+- [x] **디코더** (먼저 만들어 인코더 검증에 쓴다)
   - Fill/JPEG/basic
   - copy, palette(1bpp/8bpp), gradient 필터
   - 영구 zlib 스트림 4개와 리셋 비트, NoZlib, TPIXEL
-- [ ] **인코더**
+- [x] **인코더**
   - `tightConf`와 CL 매핑
   - 단색 영역 분할(`CheckSolidTile`/`FindBestSolidArea`/`ExtendSolidArea`)
   - `SendRectSimple` 분할
@@ -554,13 +554,29 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - TPIXEL `Pack24`
   - zlib 스트림 round-robin
   - LastRect(0xFFFF)
-- [ ] JPEG 백엔드: `turbojpeg`, 서브샘플링 매핑 {444, 420, 422, GRAY}, 회색조 Fill 변환
-- [ ] 품질 의사 인코딩 처리: coarse/fine/subsamp, 순서에 따라 덮어쓰기
-- [ ] CopyRect 인코딩/디코딩(와이어 형식)
+  - 원본의 세부 동작을 그대로 따른다.
+    - `FillPalette`에서 c1의 첫 픽셀은 개수에 넣지 않는다.
+    - zlib 스트림 번호는 최상위 사각형마다 0부터 다시 시작한다.
+    - 회색조 JPEG 모드에서는 휘도 값으로 단색 영역을 찾으므로 사실상 분할이 일어나지 않는다.
+    - 8bpp 클라이언트에도 JPEG를 보낸다.
+- [x] JPEG 백엔드: 서브샘플링 매핑 {444, 420, 422, GRAY}, 회색조 Fill 변환
+  - 기본은 순수 Rust(`jpeg-encoder`/`zune-jpeg`)이고, `rfb-codec/turbojpeg` feature를 켜면 libjpeg-turbo를 쓴다(CMake와 NASM 필요).
+- [x] zlib: 레벨 변경을 `deflateParams`로 하므로 C zlib(`libz-sys` 정적 빌드)를 직접 감싼다(`tight/zstream.rs`, 크레이트 안의 유일한 `unsafe`).
+  - flate2는 호출 사이에 `next_out`을 비워 `set_level`이 실패한다.
+  - 스트림을 리셋하면 Java 뷰어 버그를 건드린다.
+  - inflate는 flate2를 쓴다.
+- [x] 품질 의사 인코딩 처리: coarse/fine/subsamp, 순서에 따라 덮어쓰기
+  - Raw/Tight 외의 인코딩(Hextile, ZRLE 등)은 M8 전까지 건너뛴다.
+- [x] CopyRect 인코딩/디코딩(와이어 형식). 서버는 아직 CopyRect를 만들지 않는다(§4.1).
 - **DoD**
   - Java 뷰어 5개 프리셋 전부에서 화면이 깨지지 않는다.
   - Xvnc → MiniVNC 클라이언트에서 디코딩 결과가 무손실 모드에서 서버 화면과 비트 단위로 같다.
   - 같은 입력에서 TurboVNC 대비 출력 크기 ±10% 이내(녹화 데이터 기준).
+- **검증 기록 (2026-11-02)**
+  - 시험 이미지는 1024x768 3종이다: 스크린숏형(ui), 사진형(photo), 혼합(mixed). Xvnc에는 `xwud`로, MiniVNC에는 PNG 소스로 띄웠다. `rfb-snapshot -preset`으로 Java 뷰어와 같은 SetEncodings를 보내 비교했다. 녹화 도구(M7)가 없어 "녹화 데이터" 대신 이 방법을 썼다.
+  - **비트 일치**: 무손실 프리셋(lossless, lossless-zlib, raw)에서 이미지 3종 모두 원본과 0픽셀 차이였다. Xvnc → MiniVNC 클라이언트와 MiniVNC 서버 → MiniVNC 클라이언트 양쪽 다 해당한다.
+  - **Java 뷰어**: 5개 프리셋 모두 정상 표시됐다. 뷰어 창을 캡처해 비교한 결과, 무손실 2종은 원본과 0픽셀 차이였고 JPEG 3종의 평균 오차는 Xvnc와 비슷했다.
+  - **출력 크기**(MiniVNC / TurboVNC 3.3.1): 순수 Rust JPEG에서 0.989~1.052, `turbojpeg`에서 0.989~1.022였다.
 
 ### M3. 실제 화면 서버 — X11 (2주)
 - [ ] `capture-x11`

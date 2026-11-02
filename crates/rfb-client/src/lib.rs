@@ -8,7 +8,8 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use rfb_auth::Password;
-use rfb_codec::{CodecError, Framebuffer, raw};
+use rfb_codec::tight::TightDecoder;
+use rfb_codec::{CodecError, DecodeError, Framebuffer, copyrect, raw};
 use rfb_proto::consts::*;
 use rfb_proto::handshake::{ClientInit, SecurityOffer, SecurityResult, ServerInit, Version};
 use rfb_proto::msg::{ClientMessage, CutText, RectHeader, ServerMessage, ServerParseCtx};
@@ -19,6 +20,8 @@ pub enum ClientError {
     Io(io::Error),
     Proto(ProtoError),
     Codec(CodecError),
+    /// A rectangle could not be decoded.
+    Decode(DecodeError),
     /// The server refused the connection before authentication.
     ConnFailed(String),
     /// Authentication failed; 3.8 servers give a reason.
@@ -37,6 +40,7 @@ impl fmt::Display for ClientError {
             Self::Io(e) => write!(f, "{e}"),
             Self::Proto(e) => write!(f, "protocol error: {e}"),
             Self::Codec(e) => write!(f, "{e}"),
+            Self::Decode(e) => write!(f, "decoding failed: {e}"),
             Self::ConnFailed(reason) => write!(f, "connection refused by server: {reason}"),
             Self::AuthFailed(Some(reason)) => write!(f, "authentication failed: {reason}"),
             Self::AuthFailed(None) => f.write_str("authentication failed"),
@@ -69,6 +73,15 @@ impl From<ProtoError> for ClientError {
 impl From<CodecError> for ClientError {
     fn from(e: CodecError) -> Self {
         Self::Codec(e)
+    }
+}
+
+impl From<DecodeError> for ClientError {
+    fn from(e: DecodeError) -> Self {
+        match e {
+            DecodeError::Io(e) => Self::Io(e),
+            e => Self::Decode(e),
+        }
     }
 }
 
@@ -105,6 +118,23 @@ pub enum Event {
 struct Conn<S> {
     stream: S,
     buf: Vec<u8>,
+    /// Bytes read from the stream so far.
+    received: u64,
+}
+
+/// Lets decoders read rectangle data: buffered bytes first, then the stream.
+impl<S: Read> Read for Conn<S> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if !self.buf.is_empty() {
+            let n = out.len().min(self.buf.len());
+            out[..n].copy_from_slice(&self.buf[..n]);
+            self.buf.drain(..n);
+            return Ok(n);
+        }
+        let n = self.stream.read(out)?;
+        self.received += n as u64;
+        Ok(n)
+    }
 }
 
 impl<S: Read + Write> Conn<S> {
@@ -114,6 +144,7 @@ impl<S: Read + Write> Conn<S> {
         if n == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
+        self.received += n as u64;
         self.buf.extend_from_slice(&chunk[..n]);
         Ok(())
     }
@@ -156,6 +187,7 @@ pub struct Client<S> {
     server_format: PixelFormat,
     fb: Framebuffer,
     ctx: ServerParseCtx,
+    tight: TightDecoder,
 }
 
 impl<S: Read + Write> Client<S> {
@@ -164,6 +196,7 @@ impl<S: Read + Write> Client<S> {
         let mut conn = Conn {
             stream,
             buf: Vec::new(),
+            received: 0,
         };
         let offered = conn.parse(Version::parse)?;
         let version = offered
@@ -227,6 +260,7 @@ impl<S: Read + Write> Client<S> {
             server_format: init.format,
             fb: Framebuffer::new(init.width, init.height, init.format),
             ctx: ServerParseCtx::default(),
+            tight: TightDecoder::new(),
         })
     }
 
@@ -245,6 +279,11 @@ impl<S: Read + Write> Client<S> {
 
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.fb
+    }
+
+    /// Total bytes received from the server, handshake included.
+    pub fn bytes_received(&self) -> u64 {
+        self.conn.received
     }
 
     /// Switches to `format` and clears the framebuffer. Request a
@@ -303,6 +342,32 @@ impl<S: Read + Write> Client<S> {
                     changed.push(header.rect);
                 }
                 // Only reachable with num_rects == 0xFFFF.
+                ENCODING_TIGHT => {
+                    self.tight
+                        .decode(&mut self.conn, header.rect, &mut self.fb)?;
+                    changed.push(header.rect);
+                }
+                ENCODING_COPY_RECT => {
+                    let src = self.conn.read_array()?;
+                    copyrect::decode(&mut self.fb, header.rect, src)?;
+                    changed.push(header.rect);
+                }
+                // Cursor shapes are read and discarded until the viewer can
+                // show them (M5). Requesting them keeps the server from
+                // drawing the cursor into the framebuffer.
+                ENCODING_RICH_CURSOR | ENCODING_X_CURSOR => {
+                    let r = header.rect;
+                    let mask = usize::from(r.w).div_ceil(8) * usize::from(r.h);
+                    let len = match header.encoding {
+                        ENCODING_RICH_CURSOR => {
+                            r.area() as usize * self.fb.bytes_per_pixel() + mask
+                        }
+                        _ if r.area() == 0 => 0,
+                        _ => 6 + 2 * mask,
+                    };
+                    self.conn.ensure(len)?;
+                    self.conn.buf.drain(..len);
+                }
                 ENCODING_LAST_RECT => break,
                 e => return Err(ClientError::UnsupportedEncoding(e)),
             }

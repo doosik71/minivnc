@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use rfb_auth::Passwords;
 use rfb_client::{Client, ConnectOptions, Event};
-use rfb_proto::consts::ENCODING_RAW;
+use rfb_proto::consts::*;
 use rfb_proto::{PixelFormat, Rect};
 use rfb_region::Region;
 
@@ -19,7 +19,47 @@ const USAGE: &str = "\
 usage: rfb-snapshot [options] HOST[:DISPLAY | ::PORT] OUTPUT.png
 
   -passwd FILE    VNC password file (TurboVNC format)
-  -timeout SECS   give up after SECS seconds without data (default 10)";
+  -preset NAME    encoding settings, as in the TurboVNC viewer:
+                    lossless       Tight, JPEG off, CL 0 (default)
+                    lossless-zlib  Tight, JPEG off, CL 6
+                    perceptual     Tight, JPEG Q95, 1X, CL 1
+                    medium         Tight, JPEG Q80, 2X, CL 6
+                    low            Tight, JPEG Q30, 4X, CL 7
+                    raw            Raw
+  -timeout SECS   give up after SECS seconds without data (default 10)
+
+Prints the number of bytes the screen update took.";
+
+/// `SetEncodings` list for a preset, ordered like the TurboVNC viewer's.
+/// RichCursor keeps servers from drawing the cursor into the screen image.
+fn preset_encodings(name: &str) -> Option<Vec<i32>> {
+    let tight = |cl: i32, jpeg: Option<(i32, i32)>| {
+        let mut list = vec![
+            ENCODING_TIGHT,
+            ENCODING_RICH_CURSOR,
+            ENCODING_TIGHT_WITHOUT_ZLIB,
+            ENCODING_LAST_RECT,
+            ENCODING_COMPRESS_LEVEL0 + cl,
+        ];
+        if let Some((quality, subsamp)) = jpeg {
+            list.extend([
+                ENCODING_QUALITY_LEVEL0 + (quality / 10).min(9),
+                ENCODING_FINE_QUALITY_LEVEL0 + quality,
+                ENCODING_SUBSAMP_1X + subsamp,
+            ]);
+        }
+        list
+    };
+    Some(match name {
+        "lossless" => tight(0, None),
+        "lossless-zlib" => tight(6, None),
+        "perceptual" => tight(1, Some((95, 0))),
+        "medium" => tight(6, Some((80, 2))),
+        "low" => tight(7, Some((30, 1))),
+        "raw" => vec![ENCODING_RAW, ENCODING_RICH_CURSOR],
+        _ => return None,
+    })
+}
 
 /// Format requested from the server: 32bpp little-endian RGB888.
 const RGB888: PixelFormat = PixelFormat {
@@ -36,17 +76,24 @@ struct Options {
     port: u16,
     output: PathBuf,
     passwd: Option<PathBuf>,
+    encodings: Vec<i32>,
     timeout: Duration,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut passwd = None;
+    let mut encodings = preset_encodings("lossless").expect("known preset");
     let mut timeout = Duration::from_secs(10);
     let mut positional = Vec::new();
     let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-passwd" => passwd = Some(args.next().ok_or("-passwd needs a value")?.into()),
+            "-preset" => {
+                let name = args.next().ok_or("-preset needs a value")?;
+                encodings =
+                    preset_encodings(&name).ok_or_else(|| format!("unknown preset {name}"))?;
+            }
             "-timeout" => {
                 let secs: u64 = args
                     .next()
@@ -66,6 +113,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         port,
         output: output.into(),
         passwd,
+        encodings,
         timeout,
     })
 }
@@ -126,8 +174,9 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     client.set_pixel_format(RGB888)?;
-    client.set_encodings(&[ENCODING_RAW])?;
+    client.set_encodings(&opts.encodings)?;
     let screen = Rect::new(0, 0, w, h);
+    let before = client.bytes_received();
     client.request_update(false, screen)?;
 
     // Keep reading until every pixel has been received at least once.
@@ -143,6 +192,7 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    println!("update bytes: {}", client.bytes_received() - before);
 
     let mut encoder = png::Encoder::new(
         BufWriter::new(File::create(&opts.output)?),

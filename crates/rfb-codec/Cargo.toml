@@ -8,10 +8,20 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib"] }
+jpeg-encoder = "0.7.1"
+libc = "0.2.191"
+libz-sys = { version = "1.1.31", features = ["static"] }
 rfb-proto = { path = "../rfb-proto" }
+turbojpeg = { version = "1.5.1", features = ["cmake"], optional = true }
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
 
 [dev-dependencies]
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+turbojpeg = ["dep:turbojpeg"]

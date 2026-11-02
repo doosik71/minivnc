@@ -4,6 +4,7 @@
 //! framebuffer; each client connection is a tokio task that is told about
 //! changed areas through a broadcast channel.
 
+mod encodings;
 mod session;
 pub mod source;
 

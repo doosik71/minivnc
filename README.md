@@ -7,7 +7,7 @@ TurboVNC의 강점을 Rust로 옮겨, 메모리 안전하고 배포하기 쉬운
 - 지연 업데이트와 혼잡 제어
 - 자동 무손실 갱신(ALR)
 
-> **상태:** M1(프로토콜 코어 + Raw)을 마쳤습니다. 서버는 테스트용 화면(합성 패턴/PNG)을 Raw 인코딩과 VncAuth로 제공하며 TurboVNC 뷰어로 접속할 수 있습니다. 실제 화면 캡처(M3)와 뷰어 GUI(M4)는 아직 없습니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
+> **상태:** M2(Tight 인코딩)를 마쳤습니다. 서버는 테스트용 화면(합성 패턴/PNG)을 TurboVNC 방식의 Tight(JPEG 포함) 또는 Raw로 제공합니다. TurboVNC 뷰어의 모든 화질 프리셋으로 접속할 수 있으며, 출력 크기는 TurboVNC와 ±5% 안입니다. 실제 화면 캡처(M3)와 뷰어 GUI(M4)는 아직 없습니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
 
 ---
 
@@ -65,18 +65,20 @@ minivnc/
 └── README.md
 ```
 
-## 빌드 (예정)
+## 빌드
 
 요구 사항:
-- Rust stable (최신)
-- libjpeg-turbo (`turbojpeg` 크레이트 vendored 빌드도 가능)
-- Linux 서버 빌드: X11 개발 헤더(xcb, shm, damage, xfixes, xtest, randr), 필요하면 PAM
+- Rust stable (1.88 이상)
+- C 컴파일러: zlib을 소스에서 정적 빌드합니다(Windows는 MSVC, Linux는 gcc/clang).
+- 선택: libjpeg-turbo JPEG 백엔드(`--features rfb-codec/turbojpeg`)를 쓰려면 CMake와 NASM이 필요합니다. 기본 JPEG 백엔드는 순수 Rust입니다.
+- (예정) Linux 서버 빌드: X11 개발 헤더(xcb, shm, damage, xfixes, xtest, randr), 필요하면 PAM
 
 ```sh
 cargo build --release
+cargo build --release --workspace --features rfb-codec/turbojpeg   # libjpeg-turbo 사용
 ```
 
-## 현재 시험해 볼 수 있는 것 (M1)
+## 현재 시험해 볼 수 있는 것 (M2)
 
 ```sh
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
@@ -86,8 +88,9 @@ echo secret12 | minivnc-passwd -f > passwd
 minivnc-server :2 -rfbauth passwd -geometry 800x600
 minivnc-server :2 -rfbauth passwd -source png:shots/
 
-# 아무 VNC 서버에 접속해 화면을 PNG로 저장
-rfb-snapshot -passwd passwd localhost:2 screen.png
+# 아무 VNC 서버에 접속해 화면을 PNG로 저장하고 받은 바이트 수를 출력
+# (프리셋: lossless, lossless-zlib, perceptual, medium, low, raw)
+rfb-snapshot -passwd passwd -preset medium localhost:2 screen.png
 ```
 
 ## 사용 예 (예정)

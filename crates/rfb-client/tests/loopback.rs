@@ -13,14 +13,29 @@ use rfb_region::Region;
 use rfb_server::source::{RGB888, SyntheticSource};
 use rfb_server::{Config, FrameSource, Server};
 
-const W: u16 = 96;
-const H: u16 = 80;
+const W: u16 = 200;
+const H: u16 = 120;
 
-/// Static screen: a different colour in every pixel.
+/// Static screen with areas for each Tight subencoding: noise (full colour
+/// or JPEG), a two-colour checkerboard, five-colour stripes, and a large
+/// solid area.
 struct Pattern;
 
 fn pattern_rgb(x: u16, y: u16) -> [u8; 3] {
-    [(x * 2) as u8, (y * 3) as u8, (x ^ y) as u8]
+    const STRIPES: [[u8; 3]; 5] = [
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [255, 255, 0],
+        [0, 0, 0],
+    ];
+    match (x, y) {
+        (0..64, 0..48) => [(x * 7 + y * 13) as u8, (x * y) as u8, ((x ^ y) * 3) as u8],
+        (64..128, 0..48) if (x / 3 + y / 2).is_multiple_of(2) => [0, 0, 0],
+        (64..128, 0..48) => [255, 255, 255],
+        (_, 48..80) => STRIPES[usize::from(x % 5)],
+        _ => [30, 60, 90],
+    }
 }
 
 impl FrameSource for Pattern {
@@ -114,53 +129,138 @@ fn full_update_matches_screen_in_each_pixel_format() {
         shift: [0; 3],
     };
 
-    for format in [None, Some(rgb565_be), Some(colour_map)] {
-        let mut client = connect(addr, Some(b"secret")).unwrap();
-        assert_eq!(client.name(), "loopback");
-        assert_eq!(
-            (client.framebuffer().width(), client.framebuffer().height()),
-            (W, H)
-        );
-
-        // Expected image: the pattern quantised through the client format.
-        let mut client_format = *client.server_format();
-        if let Some(f) = format {
-            client.set_pixel_format(f).unwrap();
-            client_format = if f.true_colour {
-                f
-            } else {
-                rfb_codec::translate::BGR233
-            };
+    // None = never send SetEncodings (TurboVNC then uses Tight, CL 1).
+    let mut encoding_lists: Vec<Option<Vec<i32>>> = vec![None, Some(vec![ENCODING_RAW])];
+    for cl in [0, 1, 6, 9] {
+        for extra in [vec![], vec![ENCODING_TIGHT_WITHOUT_ZLIB]] {
+            let mut list = vec![
+                ENCODING_TIGHT,
+                ENCODING_LAST_RECT,
+                ENCODING_COMPRESS_LEVEL0 + cl,
+            ];
+            list.extend(extra);
+            encoding_lists.push(Some(list));
         }
-        let mut expected = Framebuffer::new(W, H, client_format);
-        for y in 0..H {
-            for x in 0..W {
-                expected
-                    .fill_rect(
-                        Rect::new(x, y, 1, 1),
-                        pack_rgb(&client_format, pattern_rgb(x, y)),
-                    )
-                    .unwrap();
-            }
-        }
-
-        client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
-        if format == Some(colour_map) {
-            match client.read_message().unwrap() {
-                Event::SetColourMapEntries {
-                    first_colour: 0,
-                    colours,
-                } => assert_eq!(colours.len(), 256),
-                other => panic!("expected colour map, got {other:?}"),
-            }
-        }
-        next_update(&mut client);
-        assert_eq!(
-            client.framebuffer().data(),
-            expected.data(),
-            "format {format:?}"
-        );
     }
+
+    for format in [None, Some(rgb565_be), Some(colour_map)] {
+        for encodings in &encoding_lists {
+            let mut client = connect(addr, Some(b"secret")).unwrap();
+            assert_eq!(client.name(), "loopback");
+            assert_eq!(
+                (client.framebuffer().width(), client.framebuffer().height()),
+                (W, H)
+            );
+            if let Some(list) = encodings {
+                client.set_encodings(list).unwrap();
+            }
+
+            // Expected image: the pattern quantised through the client format.
+            let mut client_format = *client.server_format();
+            if let Some(f) = format {
+                client.set_pixel_format(f).unwrap();
+                client_format = if f.true_colour {
+                    f
+                } else {
+                    rfb_codec::translate::BGR233
+                };
+            }
+            let mut expected = Framebuffer::new(W, H, client_format);
+            for y in 0..H {
+                for x in 0..W {
+                    expected
+                        .fill_rect(
+                            Rect::new(x, y, 1, 1),
+                            pack_rgb(&client_format, pattern_rgb(x, y)),
+                        )
+                        .unwrap();
+                }
+            }
+
+            client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+            if format == Some(colour_map) {
+                match client.read_message().unwrap() {
+                    Event::SetColourMapEntries {
+                        first_colour: 0,
+                        colours,
+                    } => assert_eq!(colours.len(), 256),
+                    other => panic!("expected colour map, got {other:?}"),
+                }
+            }
+            next_update(&mut client);
+            assert_eq!(
+                client.framebuffer().data(),
+                expected.data(),
+                "format {format:?}, encodings {encodings:?}"
+            );
+        }
+    }
+}
+
+/// SetEncodings as the TurboVNC viewer sends it for a JPEG preset.
+fn jpeg_preset(cl: i32, quality: i32, subsamp: i32) -> Vec<i32> {
+    vec![
+        ENCODING_TIGHT,
+        ENCODING_LAST_RECT,
+        ENCODING_COMPRESS_LEVEL0 + cl,
+        ENCODING_QUALITY_LEVEL0 + (quality / 10).min(9),
+        ENCODING_FINE_QUALITY_LEVEL0 + quality,
+        ENCODING_SUBSAMP_1X + subsamp,
+    ]
+}
+
+#[test]
+fn tight_jpeg_presets_are_close() {
+    let addr = start(Pattern, vec![SEC_TYPE_NONE]);
+    // Perceptually lossless, Medium, Low, and grayscale (subsampling level
+    // 1 = 4X, 2 = 2X, 3 = Gray).
+    for (preset, limit) in [
+        (jpeg_preset(1, 95, 0), 2),
+        (jpeg_preset(6, 80, 2), 4),
+        (jpeg_preset(7, 30, 1), 10),
+        (jpeg_preset(1, 80, 3), 40),
+    ] {
+        let mut client = connect(addr, None).unwrap();
+        client.set_encodings(&preset).unwrap();
+        client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+        next_update(&mut client);
+        let got = client.framebuffer().to_rgb8();
+        let want: Vec<u8> = (0..H)
+            .flat_map(|y| (0..W).flat_map(move |x| pattern_rgb(x, y)))
+            .collect();
+        let mean = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum::<u64>()
+            / want.len() as u64;
+        assert!(mean <= limit, "{preset:?}: mean error {mean}");
+    }
+}
+
+#[test]
+fn tight_streams_survive_many_updates() {
+    // The moving square produces a new small update every 100 ms; zlib
+    // streams carry state across all of them.
+    let addr = start(SyntheticSource::new(320, 200), vec![SEC_TYPE_NONE]);
+    let mut client = connect(addr, None).unwrap();
+    client
+        .set_encodings(&[
+            ENCODING_TIGHT,
+            ENCODING_LAST_RECT,
+            ENCODING_COMPRESS_LEVEL0 + 1,
+        ])
+        .unwrap();
+    let all = Rect::new(0, 0, 320, 200);
+    client.request_update(false, all).unwrap();
+    next_update(&mut client);
+    for _ in 0..10 {
+        client.request_update(true, all).unwrap();
+        assert!(!next_update(&mut client).is_empty());
+    }
+    // A full refresh still decodes after the streams were reused.
+    client.request_update(false, all).unwrap();
+    next_update(&mut client);
 }
 
 #[test]
