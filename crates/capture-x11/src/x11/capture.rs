@@ -14,6 +14,7 @@ use rfb_server::source::to_wire_rect;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tracing::{debug, warn};
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::errors::ReplyError;
 use x11rb::protocol::Event;
 use x11rb::protocol::damage::{self, ConnectionExt as _, ReportLevel};
 use x11rb::protocol::shm::{self, ConnectionExt as _};
@@ -101,12 +102,17 @@ impl X11Source {
     }
 
     fn fetch_cursor(&mut self) -> io::Result<()> {
-        let c = self
-            .conn
-            .xfixes_get_cursor_image()
-            .map_err(xerr)?
-            .reply()
-            .map_err(xerr)?;
+        let c = match self.conn.xfixes_get_cursor_image().map_err(xerr)?.reply() {
+            Ok(c) => c,
+            // The X server can refuse (BadAccess was seen while an xfce
+            // session exited). Go on without a cursor until it changes again.
+            Err(ReplyError::X11Error(e)) => {
+                debug!("cannot get the cursor image: {e:?}");
+                self.cursor = None;
+                return Ok(());
+            }
+            Err(e) => return Err(xerr(e)),
+        };
         self.pointer = (c.x.into(), c.y.into());
         self.cursor = Some(Cursor {
             hot: (c.xhot.into(), c.yhot.into()),

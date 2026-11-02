@@ -161,6 +161,7 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let options = ConnectOptions {
         password,
         shared: true,
+        ..Default::default()
     };
     let mut client = Client::connect(stream, &options)?;
     let (w, h) = (client.framebuffer().width(), client.framebuffer().height());

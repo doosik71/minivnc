@@ -7,7 +7,7 @@ TurboVNC의 강점을 Rust로 옮겨, 메모리 안전하고 배포하기 쉬운
 - 지연 업데이트와 혼잡 제어
 - 자동 무손실 갱신(ALR)
 
-> **상태:** M3(X11 서버)를 마쳤습니다. Linux에서 기존 X 디스플레이(Xvfb, Xorg)를 TurboVNC 방식의 Tight(JPEG 포함) 또는 Raw로 공유하고, 키보드·마우스 입력을 XTest로 주입합니다. Xvfb + xfce4 세션을 TurboVNC Java 뷰어로 쓸 수 있습니다(타이핑, 창 이동, 동영상 재생). 커서 인코딩·화면 크기 변경(M5)과 뷰어 GUI(M4)는 아직 없습니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
+> **상태:** M4(뷰어 MVP)를 마쳤습니다. 서버는 Linux에서 기존 X 디스플레이(Xvfb, Xorg)를 TurboVNC 방식의 Tight(JPEG 포함) 또는 Raw로 공유하고, 키보드·마우스 입력을 XTest로 주입합니다. 뷰어(`minivnc-viewer`)는 TurboVNC 스타일 옵션으로 TurboVNC 서버(Xvnc)와 MiniVNC 서버에 접속해 화면 표시, 키보드, 마우스·휠, 스크롤을 지원합니다. 커서 모양, 화면 크기 변경, 클립보드, 한/영·한자 키의 QEMU 경로는 M5에서 합니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
 
 ---
 
@@ -23,14 +23,14 @@ TurboVNC의 강점을 Rust로 옮겨, 메모리 안전하고 배포하기 쉬운
 
 ## 주요 기능 (계획)
 
-| 분류 | 기능 |
-|---|---|
-| 프로토콜 | RFB 3.3 / 3.7 / 3.8, TightVNC 확장, Fence, Continuous Updates, ExtendedDesktopSize, QEMU Extended Key Event, Extended Clipboard |
-| 인코딩 | **TurboVNC Tight** (JPEG, 팔레트, 모노, 단색 영역 분할, 멀티스레드), CopyRect, Raw, ZRLE, Hextile |
-| 화질 제어 | JPEG 품질 1–100, 크로마 서브샘플링 1X/2X/4X/Gray, 압축 레벨 0–9, Interframe Comparison, Automatic Lossless Refresh |
-| 보안 | None, VncAuth, Tight, VeNCrypt (TLS/X509 + None/Vnc/Plain), UnixLogin/PAM, OTP, view-only 비밀번호, 무차별 대입 차단 |
-| 서버 | X11 화면 캡처(XShm + XDamage), XTest 입력, RandR 크기 변경, 다중 클라이언트, WebSocket(noVNC), 역방향 연결 |
-| 뷰어 | 네이티브 창, 스케일링, 전체 화면 및 다중 모니터, 키보드 그랩, 클립보드, SSH 터널 |
+| 분류      | 기능                                                                                                                            |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 프로토콜  | RFB 3.3 / 3.7 / 3.8, TightVNC 확장, Fence, Continuous Updates, ExtendedDesktopSize, QEMU Extended Key Event, Extended Clipboard |
+| 인코딩    | **TurboVNC Tight** (JPEG, 팔레트, 모노, 단색 영역 분할, 멀티스레드), CopyRect, Raw, ZRLE, Hextile                               |
+| 화질 제어 | JPEG 품질 1–100, 크로마 서브샘플링 1X/2X/4X/Gray, 압축 레벨 0–9, Interframe Comparison, Automatic Lossless Refresh              |
+| 보안      | None, VncAuth, Tight, VeNCrypt (TLS/X509 + None/Vnc/Plain), UnixLogin/PAM, OTP, view-only 비밀번호, 무차별 대입 차단            |
+| 서버      | X11 화면 캡처(XShm + XDamage), XTest 입력, RandR 크기 변경, 다중 클라이언트, WebSocket(noVNC), 역방향 연결                      |
+| 뷰어      | 네이티브 창, 스케일링, 전체 화면 및 다중 모니터, 키보드 그랩, 클립보드, SSH 터널                                                |
 
 ### TurboVNC와의 차이
 
@@ -72,13 +72,14 @@ minivnc/
 - C 컴파일러: zlib을 소스에서 정적 빌드합니다(Windows는 MSVC, Linux는 gcc/clang).
 - 선택: libjpeg-turbo JPEG 백엔드(`--features rfb-codec/turbojpeg`)를 쓰려면 CMake와 NASM이 필요합니다. 기본 JPEG 백엔드는 순수 Rust입니다.
 - Linux X11 서버는 순수 Rust X 프로토콜 구현(x11rb)을 쓰므로 X11 개발 헤더가 필요 없습니다. X 서버에는 MIT-SHM(없으면 느린 GetImage 사용), DAMAGE, XTEST, XKEYBOARD 확장이 있어야 합니다.
+- 뷰어는 winit + softbuffer로 그리며 빌드에 추가 시스템 패키지가 필요 없습니다. Linux에서는 실행할 때 X11(또는 Wayland)과 libxkbcommon 라이브러리를 불러옵니다.
 
 ```sh
 cargo build --release
 cargo build --release --workspace --features rfb-codec/turbojpeg   # libjpeg-turbo 사용
 ```
 
-## 현재 시험해 볼 수 있는 것 (M3)
+## 현재 시험해 볼 수 있는 것 (M4)
 
 ```sh
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
@@ -96,6 +97,12 @@ minivnc-server :1 -display :1 -rfbauth passwd
 minivnc-server :2 -rfbauth passwd -source pattern -geometry 800x600
 minivnc-server :2 -rfbauth passwd -source png:shots/
 
+# 뷰어로 접속 (Windows/Linux). 비밀번호 옵션이 없으면 필요할 때 콘솔에서 묻는다.
+minivnc-viewer myhost:1
+minivnc-viewer myhost:1 -PasswordFile=passwd -Quality=80 -Subsampling=2X
+minivnc-viewer myhost::5901 -JPEG=0 -CompressLevel=0   # 무손실
+# 그 밖의 옵션: -Password=PW, -Encoding=Tight|Raw, -Shared=0, -ViewOnly
+
 # 아무 VNC 서버에 접속해 화면을 PNG로 저장하고 받은 바이트 수를 출력
 # (프리셋: lossless, lossless-zlib, perceptual, medium, low, raw)
 rfb-snapshot -passwd passwd -preset medium localhost:2 screen.png
@@ -112,24 +119,21 @@ minivnc-session -geometry 1920x1080
 
 # 기존 X 디스플레이 공유
 minivnc-server -display :0 -rfbport 5900 -rfbauth ~/.vnc/passwd
-
-# 뷰어로 접속 (TurboVNC 스타일 옵션)
-minivnc-viewer myhost:1 -Quality=80 -Subsampling=2X
 ```
 
 ## 로드맵
 
-| 단계 | 내용 |
-|---|---|
-| M0 | 워크스페이스, 프로토콜 상수, 영역 연산 |
-| M1 | 핸드셰이크, VncAuth, Raw 인코딩 |
-| M2 | **Tight 인코더/디코더 (JPEG 포함)** |
-| M3 | X11 캡처 서버 |
-| M4 | 뷰어 MVP |
-| M5 | Fence/CU/흐름 제어, 데스크톱 크기 변경, QEMU 키(한/영·한자), 커서, 클립보드 |
-| M6 | Tight 보안, VeNCrypt/TLS, PAM, OTP |
-| M7 | 멀티스레드 인코딩, Interframe Comparison, ALR, 벤치마크 |
-| M8 | ZRLE/Hextile, WebSocket, 역방향 연결, SSH 터널, 세션 관리 |
+| 단계 | 내용                                                                        |
+| ---- | --------------------------------------------------------------------------- |
+| M0   | 워크스페이스, 프로토콜 상수, 영역 연산                                      |
+| M1   | 핸드셰이크, VncAuth, Raw 인코딩                                             |
+| M2   | **Tight 인코더/디코더 (JPEG 포함)**                                         |
+| M3   | X11 캡처 서버                                                               |
+| M4   | 뷰어 MVP                                                                    |
+| M5   | Fence/CU/흐름 제어, 데스크톱 크기 변경, QEMU 키(한/영·한자), 커서, 클립보드 |
+| M6   | Tight 보안, VeNCrypt/TLS, PAM, OTP                                          |
+| M7   | 멀티스레드 인코딩, Interframe Comparison, ALR, 벤치마크                     |
+| M8   | ZRLE/Hextile, WebSocket, 역방향 연결, SSH 터널, 세션 관리                   |
 
 마일스톤별 작업 항목과 완료 기준은 [DEVPLAN.md §5](DEVPLAN.md#5-단계별-구현-계획)를 참고하세요.
 

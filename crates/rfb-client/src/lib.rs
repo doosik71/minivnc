@@ -91,6 +91,9 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 pub struct ConnectOptions {
     /// Enables VNC authentication.
     pub password: Option<Password>,
+    /// Asked for the password when the server chooses VNC authentication
+    /// and `password` is not set.
+    pub ask_password: Option<fn() -> io::Result<Password>>,
     /// Ask the server to keep other clients connected.
     pub shared: bool,
 }
@@ -208,7 +211,8 @@ impl<S: Read + Write> Client<S> {
             SecurityOffer::Types(types) => types,
             SecurityOffer::Failed(reason) => return Err(ClientError::ConnFailed(reason)),
         };
-        let usable: &[u8] = if options.password.is_some() {
+        let can_auth = options.password.is_some() || options.ask_password.is_some();
+        let usable: &[u8] = if can_auth {
             &[SEC_TYPE_VNC_AUTH, SEC_TYPE_NONE]
         } else {
             &[SEC_TYPE_NONE]
@@ -223,7 +227,7 @@ impl<S: Read + Write> Client<S> {
             chosen
         } else {
             match types[0] {
-                SEC_TYPE_VNC_AUTH if options.password.is_none() => {
+                SEC_TYPE_VNC_AUTH if !can_auth => {
                     return Err(ClientError::NeedPassword);
                 }
                 t @ (SEC_TYPE_NONE | SEC_TYPE_VNC_AUTH) => t,
@@ -232,9 +236,13 @@ impl<S: Read + Write> Client<S> {
         };
 
         if sec_type == SEC_TYPE_VNC_AUTH {
-            let password = options.password.as_ref().ok_or(ClientError::NeedPassword)?;
+            let password = match (&options.password, options.ask_password) {
+                (Some(p), _) => p.clone(),
+                (None, Some(ask)) => ask()?,
+                (None, None) => return Err(ClientError::NeedPassword),
+            };
             let challenge = conn.read_array()?;
-            conn.write(&rfb_auth::encrypt_challenge(&challenge, password))?;
+            conn.write(&rfb_auth::encrypt_challenge(&challenge, &password))?;
         }
         // No SecurityResult for None before 3.8.
         if (version >= Version::V3_8 || sec_type == SEC_TYPE_VNC_AUTH)
@@ -311,9 +319,22 @@ impl<S: Read + Write> Client<S> {
 
     /// Reads and handles the next server message.
     pub fn read_message(&mut self) -> Result<Event> {
+        self.read_message_with(|_| Ok(()))
+    }
+
+    /// Like [`read_message`](Self::read_message), but calls `update_started`
+    /// as soon as a framebuffer update begins, before its rectangles are
+    /// read. Viewers send the next update request there (pipelining).
+    pub fn read_message_with(
+        &mut self,
+        update_started: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<Event> {
         let ctx = self.ctx;
         Ok(match self.conn.parse(|b| ServerMessage::parse(b, &ctx))? {
-            ServerMessage::FramebufferUpdate { num_rects } => self.read_update(num_rects)?,
+            ServerMessage::FramebufferUpdate { num_rects } => {
+                update_started(self)?;
+                self.read_update(num_rects)?
+            }
             ServerMessage::SetColourMapEntries {
                 first_colour,
                 colours,

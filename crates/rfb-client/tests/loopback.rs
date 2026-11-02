@@ -116,6 +116,7 @@ fn connect_opts(
     let options = ConnectOptions {
         password: password.map(Password::new),
         shared,
+        ..Default::default()
     };
     Client::connect(stream, &options)
 }

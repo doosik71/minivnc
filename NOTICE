@@ -18,3 +18,11 @@ TurboVNC common/rfb/rfbproto.h:
   Copyright (C) 2004 Landmark Graphics Corporation. All Rights Reserved.
   Copyright (C) 2000 Tridia Corporation. All Rights Reserved.
   Copyright (C) 1999 AT&T Laboratories Cambridge. All Rights Reserved.
+
+bins/minivnc-viewer/src/ucs_table.rs is generated from TurboVNC
+java/com/turbovnc/rfb/UnicodeToKeysym.java (derived from keysym2ucs.c by
+Markus G. Kuhn, University of Cambridge):
+
+  Copyright (C) 2018 D. R. Commander.  All Rights Reserved.
+  Copyright (C) 2013 Brian P. Hinz
+  Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.

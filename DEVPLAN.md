@@ -601,14 +601,30 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - **동영상**: mpv(640x360, 30fps 시험 영상, `--vo=x11`) 재생 중 클라이언트가 초당 23.5개 업데이트(1.2MB/s)를 받았다. 이때 서버 CPU 사용률은 약 17%였다.
 
 ### M4. MiniVNC 뷰어 MVP (3주)
-- [ ] `winit` + `softbuffer` 창, 손상 영역 블릿, 창 크기 = 원격 크기, 스크롤
-- [ ] 마우스: 버튼, 휠(4/5/6/7), 좌표 변환
-- [ ] 키보드
-  - keysym 경로: 논리 키/문자 → keysym, `UnicodeToKeysym` 테이블
-  - 눌린 키 추적, 포커스를 잃으면 키를 모두 해제
-- [ ] 연결 대화상자(egui), 비밀번호 입력, CLI(`minivnc-viewer host:display`, `-Password`, `-Encoding`, `-Quality`, ...)
-- [ ] 요청 파이프라이닝(FBU 시작 시 다음 요청 전송)
+- [x] `winit` + `softbuffer` 창, 창 크기 = 원격 크기, 스크롤
+  - RFB 스레드가 32bpp RGB888을 요청해 디코딩하고, 바뀐 사각형만 공유 화면 버퍼에 복사한 뒤 창에 알린다. 알림은 하나만 쌓이므로 업데이트가 몰려도 창은 최신 화면을 한 번 그린다.
+  - 다시 그릴 때는 보이는 영역 전체를 복사한다. 손상 영역만 블릿하는 최적화는 필요해지면 한다.
+  - 창은 원격 크기보다 커지지 않는다. 작아지면 스크롤바가 생기고, 끌어서 화면을 옮긴다.
+  - 원격 커서는 서버가 그린다(커서 인코딩은 M5). 로컬 커서는 TurboVNC 뷰어처럼 작은 점으로 바꾼다.
+- [x] 마우스: 버튼 1~3, 휠 4/5(세로)와 6/7(가로, 클릭 단위로 누적), 창 좌표 + 스크롤 오프셋 → 원격 좌표
+- [x] 키보드
+  - keysym 경로: winit 논리 키(Shift·배열 반영, Ctrl 미반영)/문자 → keysym, `UnicodeToKeysym` 테이블(Java 뷰어에서 생성), 키패드는 `KP_*`
+  - 한/영·한자 키는 `Hangul`/`Hangul_Hanja` keysym으로 보낸다. QEMU 스캔코드 경로는 M5에서 한다.
+  - 눌린 키를 물리 키별로 추적해 같은 keysym으로 놓고, 포커스를 잃으면 키를 모두 해제한다.
+  - AltGr 감지(LCtrl 직후 RAlt)는 하지 않는다. Windows에서 AltGr 배열은 Ctrl이 함께 전달된다.
+- [x] 비밀번호 입력, CLI(`minivnc-viewer host:display`, `host::port`, `-Password`, `-PasswordFile`, `-Encoding`, `-JPEG`, `-Quality`, `-Subsampling`, `-CompressLevel`, `-Shared`, `-ViewOnly`)
+  - SetEncodings 순서는 Java 뷰어(`CMsgWriter.writeSetEncodings`)를 따르되, 디코딩할 수 없는 것은 뺀다.
+  - 연결 대화상자(egui)는 M8로 미룬다. egui는 GPU 렌더러가 필요하고, winit 이벤트 루프는 프로세스당 하나뿐이어서 softbuffer 창과 함께 쓰려면 구조가 커진다. 비밀번호 옵션이 없으면 서버가 VNC 인증을 고를 때 콘솔에서 묻는다(`ConnectOptions::ask_password`).
+- [x] 요청 파이프라이닝(FBU 시작 시 다음 요청 전송, `Client::read_message_with`)
 - **DoD:** Xvnc와 MiniVNC 서버 양쪽에 접속해 일상 작업이 가능하다.
+- **검증 기록 (2026-11-02)**
+  - 환경: Windows 11의 뷰어 → WSL Ubuntu 26.04의 TurboVNC 3.3.1 Xvnc와 MiniVNC 서버(Xvfb 1280x800 + xfce4). 실제 데스크톱 입력을 주입하지 않으려고, 뷰어 창에만 창 메시지(PostMessage)를 보내 키·마우스를 시험했다.
+  - **Xvnc**: 시험 이미지(mixed, 1024x768)를 `-JPEG=0 -CompressLevel=0`으로 받은 창 캡처가 원본과 0픽셀 차이였다. 기본 설정(Tight + JPEG Q95)에서는 최대 채널 오차가 24였다.
+  - **MiniVNC 서버**: 터미널 타이핑(소문자, 숫자, 공백, Enter), Ctrl+D, 제목 표시줄 끌기로 창 이동, 휠로 터미널 스크롤백이 모두 동작했다.
+  - **스크롤**: 창을 884x561로 줄이자 스크롤바가 생겼고, 끌어서 원격 화면 오른쪽 아래로 이동했다.
+  - **연결 종료**: 서버가 끊기면 이유("the server closed the connection")를 출력하고 종료한다.
+  - 이 과정에서 서버 버그를 고쳤다: xfce 세션이 끝날 때 XFIXES `GetCursorImage`가 BadAccess를 돌려줘 캡처 스레드가 멈췄다. 이제 커서 없이 계속한다.
+  - 사람이 실제 키보드·마우스로 쓰는 감각(한글 IME, Shift 조합, 반응성)은 사용자가 직접 확인한다.
 
 ### M5. 고급 프로토콜 기능 (3주)
 - [ ] **Fence + Continuous Updates + 흐름 제어**
