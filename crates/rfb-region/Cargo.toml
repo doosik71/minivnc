@@ -1,0 +1,14 @@
+[package]
+name = "rfb-region"
+description = "Y-banded rectangle regions (pixman-style) for damage tracking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

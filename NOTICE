@@ -1,0 +1,20 @@
+MiniVNC
+Licensed under the GNU General Public License, version 2 or (at your option)
+any later version. See LICENSE.
+
+MiniVNC ports protocol definitions and algorithms from TurboVNC 3.3.2
+(https://TurboVNC.org), which is licensed under the GNU General Public
+License, version 2 or later.
+
+crates/rfb-proto/src/consts.rs is ported from, and
+crates/rfb-proto/tests/data/rfbproto.h is a verbatim copy of,
+TurboVNC common/rfb/rfbproto.h:
+
+  Copyright (C) 2009-2010, 2012-2013, 2015, 2022, 2024-2025
+            D. R. Commander.  All Rights Reserved.
+  Copyright (C) 2009 Vic Lee.  All Rights Reserved.
+  Copyright (C) 2004-2008 Sun Microsystems, Inc. All Rights Reserved.
+  Copyright (C) 2000-2006 Constantin Kaplinsky. All Rights Reserved.
+  Copyright (C) 2004 Landmark Graphics Corporation. All Rights Reserved.
+  Copyright (C) 2000 Tridia Corporation. All Rights Reserved.
+  Copyright (C) 1999 AT&T Laboratories Cambridge. All Rights Reserved.
