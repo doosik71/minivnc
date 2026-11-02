@@ -109,10 +109,10 @@ impl Region {
     /// Replaces the region with its bounding box when it has more than
     /// `max_rects` rectangles (TurboVNC `rfbCombineRect`, default 100).
     pub fn collapse_if_over(&mut self, max_rects: usize) {
-        if self.rects.len() > max_rects {
-            if let Some(extents) = self.extents() {
-                *self = Region::from(extents);
-            }
+        if self.rects.len() > max_rects
+            && let Some(extents) = self.extents()
+        {
+            *self = Region::from(extents);
         }
     }
 

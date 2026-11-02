@@ -1,0 +1,19 @@
+[package]
+name = "minivnc-server"
+description = "MiniVNC server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rfb-auth = { path = "../../crates/rfb-auth" }
+rfb-proto = { path = "../../crates/rfb-proto" }
+rfb-server = { path = "../../crates/rfb-server" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -1,0 +1,19 @@
+[package]
+name = "rfb-snapshot"
+description = "Connect to an RFB server and save the screen as PNG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+png = "0.18.1"
+rfb-auth = { path = "../../crates/rfb-auth" }
+rfb-client = { path = "../../crates/rfb-client" }
+rfb-codec = { path = "../../crates/rfb-codec" }
+rfb-proto = { path = "../../crates/rfb-proto" }
+rfb-region = { path = "../../crates/rfb-region" }
+
+[lints]
+workspace = true

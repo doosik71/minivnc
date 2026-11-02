@@ -1,0 +1,20 @@
+[package]
+name = "rfb-server"
+description = "Platform-independent RFB server engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+png = "0.18.1"
+rfb-auth = { path = "../rfb-auth" }
+rfb-codec = { path = "../rfb-codec" }
+rfb-proto = { path = "../rfb-proto" }
+rfb-region = { path = "../rfb-region" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true

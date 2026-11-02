@@ -1,0 +1,15 @@
+[package]
+name = "minivnc-passwd"
+description = "Create TurboVNC-compatible VNC password files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rfb-auth = { path = "../../crates/rfb-auth" }
+rpassword = "7.5.4"

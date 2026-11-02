@@ -1,0 +1,17 @@
+[package]
+name = "rfb-codec"
+description = "RFB framebuffers, pixel translation, and rectangle encoders/decoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rfb-proto = { path = "../rfb-proto" }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

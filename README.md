@@ -7,7 +7,7 @@ TurboVNC의 강점을 Rust로 옮겨, 메모리 안전하고 배포하기 쉬운
 - 지연 업데이트와 혼잡 제어
 - 자동 무손실 갱신(ALR)
 
-> **상태:** M0(기반 구축)을 마쳤습니다. 프로토콜 상수(`rfb-proto`)와 영역 연산(`rfb-region`)만 있고, 아직 서버나 뷰어는 동작하지 않습니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
+> **상태:** M1(프로토콜 코어 + Raw)을 마쳤습니다. 서버는 테스트용 화면(합성 패턴/PNG)을 Raw 인코딩과 VncAuth로 제공하며 TurboVNC 뷰어로 접속할 수 있습니다. 실제 화면 캡처(M3)와 뷰어 GUI(M4)는 아직 없습니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
 
 ---
 
@@ -59,7 +59,7 @@ minivnc/
 │   ├── minivnc-viewer/
 │   ├── minivnc-passwd/
 │   └── minivnc-session/
-├── tools/                # rfb-record, rfb-bench
+├── tools/                # rfb-snapshot, rfb-record, rfb-bench
 ├── turbovnc/             # 참고용 TurboVNC 3.3.2 원본 소스 (분석 대상)
 ├── DEVPLAN.md            # 분석 및 구현 계획
 └── README.md
@@ -74,6 +74,20 @@ minivnc/
 
 ```sh
 cargo build --release
+```
+
+## 현재 시험해 볼 수 있는 것 (M1)
+
+```sh
+# 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
+echo secret12 | minivnc-passwd -f > passwd
+
+# 테스트 화면 서버: 움직이는 패턴 또는 PNG 파일/디렉터리, 포트 5902
+minivnc-server :2 -rfbauth passwd -geometry 800x600
+minivnc-server :2 -rfbauth passwd -source png:shots/
+
+# 아무 VNC 서버에 접속해 화면을 PNG로 저장
+rfb-snapshot -passwd passwd localhost:2 screen.png
 ```
 
 ## 사용 예 (예정)

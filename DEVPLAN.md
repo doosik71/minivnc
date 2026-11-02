@@ -424,6 +424,7 @@ minivnc/
 │   ├── minivnc-passwd/        # vncpasswd 대응 (TurboVNC 비밀번호 파일 호환)
 │   └── minivnc-session/       # vncserver 스크립트 대응 (P2)
 ├── tools/
+│   ├── rfb-snapshot/          # 헤드리스 접속 후 화면을 PNG로 저장 (상호 운용 검증용)
 │   ├── rfb-record/            # RFB 스트림 녹화 (Xvnc -capture 대응)
 │   └── rfb-bench/             # 녹화 재생 벤치마크 (Java -bench 대응)
 └── tests/interop/             # TurboVNC 상호 운용 테스트 스크립트
@@ -516,19 +517,28 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - 대조 테스트는 저장소에 넣은 헤더 사본(`crates/rfb-proto/tests/data/rfbproto.h`)을 읽는다. `turbovnc/`는 저장소 밖을 가리키는 링크라 CI에서 읽을 수 없기 때문이다.
 
 ### M1. 프로토콜 코어 + Raw (2주)
-- [ ] 메시지 파서/직렬화기(C→S, S→C 전부)와 증분 파싱을 만든다.
-- [ ] 핸드셰이크 3.3/3.7/3.8, 보안 None/VncAuth를 구현한다.
+- [x] 메시지 파서/직렬화기(C→S, S→C 전부)와 증분 파싱을 만든다.
+  - GII 메시지는 내용을 해석하지 않고 틀(endian, subtype, payload)만 읽는다.
+  - 수신 상한(기본 1MB)을 넘는 cut text는 연결 오류로 처리한다. TurboVNC는 상한까지만 받고 나머지를 버린다.
+- [x] 핸드셰이크 3.3/3.7/3.8, 보안 None/VncAuth를 구현한다.
   - DES 비트 반전, 비밀번호 파일 호환
-  - `minivnc-passwd`: TurboVNC `~/.vnc/passwd`와 상호 호환
-- [ ] `rfb-server`
+  - `minivnc-passwd`: TurboVNC `~/.vnc/passwd`와 상호 호환 (`[-v] [FILE]`, `-f`. OTP/ACL 옵션은 M6)
+  - 챌린지는 OS CSPRNG(`getrandom`)로 만든다.
+  - TurboVNC는 Tight 보안 타입(16)을 항상 광고하지만, MiniVNC는 M6 전까지 광고하지 않는다.
+- [x] `rfb-server`
   - 리스너(TCP 5900+N)와 `ClientSession` 상태 머신
-  - SetPixelFormat, 픽셀 변환(identity / 3-테이블 / 16bpp 단일 테이블)
-  - Raw 인코딩
-- [ ] `rfb-client`: 핸드셰이크, Raw 디코딩, 프레임버퍼 관리
-- [ ] 테스트용 `FrameSource`: 합성 패턴과 PNG 시퀀스
+  - SetPixelFormat, 픽셀 변환(identity / 3-테이블 / 16bpp 단일 테이블, 8bpp 컬러맵 클라이언트는 BGR233)
+  - Raw 인코딩 (SetEncodings와 무관하게 Raw만 보낸다)
+  - 업데이트: `modified ∩ requested`를 보내고, 사각형이 100개를 넘으면 경계 상자로 합친다. 지연 업데이트·shared/exclusive 정책·입력 주입은 M3에서 한다.
+- [x] `rfb-client`: 핸드셰이크, Raw 디코딩, 프레임버퍼 관리
+- [x] 테스트용 `FrameSource`: 합성 패턴과 PNG 시퀀스 (`minivnc-server -source pattern|png:PATH`)
 - **DoD**
   - TurboVNC Java 뷰어가 MiniVNC 서버(합성 화면, Raw, VncAuth)에 접속해 화면을 표시한다.
   - MiniVNC 클라이언트(헤드리스)가 Xvnc에 접속해 프레임을 PNG로 저장한다.
+- **검증 기록 (2026-11-02)**
+  - Java 뷰어(TurboVNC 3.3.2 소스 빌드)는 `-PasswordFile`로 `minivnc-passwd`가 만든 파일을 써서 VncAuth에 성공했다. 기본 포맷(rgb888)과 `-Colors 256`(rgb332)에서 합성 화면과 움직이는 사각형이 정상 표시됐다.
+  - `rfb-snapshot`이 WSL의 TurboVNC 3.3.1 Xvnc(`-depth 24`, `-depth 16`)에 VncAuth로 접속해 800x600 PNG를 저장했다. 두 깊이의 결과는 픽셀 단위로 같았다. 틀린 비밀번호는 3.8 실패 사유와 함께 거부됐다.
+  - GitHub에 3.3.2 릴리스 패키지가 없어 Xvnc는 3.3.1을 썼다. sudo 없이 `.deb`를 풀어 실행했고, `xkbcomp`는 `-xkbcompdir`로 지정했다.
 
 ### M2. Tight 인코딩 (3주) — 핵심
 - [ ] **디코더** (먼저 만들어 인코더 검증에 쓴다)
