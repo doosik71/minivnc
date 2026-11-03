@@ -126,6 +126,15 @@ impl Congestion {
         self.pings.push_back(ping);
     }
 
+    /// The round-trip time TurboVNC stretches the ALR timer to: the
+    /// minimum measured, or else the wire latency.
+    pub fn rtt(&self) -> Option<Duration> {
+        [self.min_rtt, self.base_rtt]
+            .into_iter()
+            .find(|&ms| ms != UNKNOWN)
+            .map(|ms| Duration::from_millis(ms.into()))
+    }
+
     /// `HandleRTTPong`: the client answered the oldest ping.
     pub fn pong(&mut self, now: Instant) {
         let Some(ping) = self.pings.pop_front() else {

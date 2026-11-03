@@ -1,5 +1,5 @@
-//! Tight encoder, ported from TurboVNC `tight.c` (single-threaded; the
-//! multi-threaded split comes with M7).
+//! Tight encoder, ported from TurboVNC `tight.c`, including its split of
+//! large rectangles into horizontal bands encoded by up to four threads.
 //!
 //! The rectangle splitting, colour counting, zlib stream rotation and level
 //! choices follow the C code so that output matches TurboVNC as closely as
@@ -15,7 +15,7 @@ use super::zstream::Deflater;
 use super::{MIN_TO_COMPRESS, pack24, uses_tpixel};
 use crate::CodecError;
 use crate::framebuffer::{Framebuffer, read_pixel, unpack_rgb, write_pixel};
-use crate::jpeg::{self, Subsampling};
+use crate::jpeg::{self, Layout, Subsampling};
 use crate::translate::Translator;
 
 /// Rectangles at least this large are searched for solid areas.
@@ -23,6 +23,8 @@ const MIN_SPLIT_RECT_SIZE: i32 = 4096;
 /// Solid areas smaller than this are not sent separately.
 const MIN_SOLID_SUBRECT_SIZE: i32 = 2048;
 const MAX_SPLIT_TILE_SIZE: i32 = 16;
+/// TurboVNC `MAX_ENCODING_THREADS`.
+pub const MAX_THREADS: usize = 4;
 
 /// TurboVNC `tightConf`, indexed by the internal level from
 /// [`TightSettings::internal_level`].
@@ -133,14 +135,40 @@ impl TightSettings {
 
 /// Per-client encoder state: the four zlib streams persist for the life of
 /// the connection.
-#[derive(Default)]
 pub struct TightEncoder {
     streams: [Option<Deflater>; 4],
+    threads: usize,
+    /// Rectangles sent as JPEG since the last [`TightEncoder::take_lossy`].
+    lossy: Vec<Rect>,
+}
+
+impl Default for TightEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TightEncoder {
+    /// A single-threaded encoder.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_threads(1)
+    }
+
+    /// An encoder that splits large rectangles among up to `threads`
+    /// threads (at most [`MAX_THREADS`]), as TurboVNC `-nthreads`.
+    pub fn with_threads(threads: usize) -> Self {
+        Self {
+            streams: Default::default(),
+            threads: threads.clamp(1, MAX_THREADS),
+            lossy: Vec::new(),
+        }
+    }
+
+    /// The rectangles sent as JPEG since the last call; everything else
+    /// `encode` covered was sent losslessly (for TurboVNC's Automatic
+    /// Lossless Refresh).
+    pub fn take_lossy(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.lossy)
     }
 
     /// Number of rectangles `encode` will produce for `rect`, or `None` if
@@ -162,6 +190,14 @@ impl TightEncoder {
     }
 
     /// Appends Tight rectangles (headers included) covering `rect`.
+    ///
+    /// As in TurboVNC `rfbSendRectEncodingTight`, a rectangle of at least
+    /// two maximum subrectangles is cut into `min(threads, area / 65536)`
+    /// horizontal bands, each encoded on its own thread with its own share
+    /// of the four zlib streams, and written out in order. Unlike TurboVNC,
+    /// this happens only for clients that accept LastRect: otherwise the
+    /// rectangle count announced by [`TightEncoder::num_rects`] could differ
+    /// from what the bands produce.
     pub fn encode(
         &mut self,
         fb: &Framebuffer,
@@ -173,33 +209,141 @@ impl TightEncoder {
         if !fb.contains(rect) {
             return Err(CodecError::RectOutOfBounds(rect));
         }
-        let mut job = Job {
-            streams: &mut self.streams,
+        let conf = &CONF[settings.internal_level()];
+        let area = i32::from(rect.w) * i32::from(rect.h);
+        let nt = if settings.last_rect {
+            self.threads
+                .min((area / conf.max_rect_size) as usize)
+                .max(1)
+        } else {
+            1
+        };
+        let (x, y, w, h) = (
+            i32::from(rect.x),
+            i32::from(rect.y),
+            i32::from(rect.w),
+            i32::from(rect.h),
+        );
+        let new_job = |streams, base_stream, out| Job {
+            streams,
+            base_stream,
             fb,
             translator,
             settings,
-            conf: &CONF[settings.internal_level()],
+            conf,
             client: *translator.client_format(),
             pf24: uses_tpixel(translator.client_format()),
             stream_id: 0,
             out,
+            lossy: Vec::new(),
         };
-        job.send_rect(rect.x.into(), rect.y.into(), rect.w.into(), rect.h.into())
+        if nt == 1 {
+            let mut job = new_job(&mut self.streams[..], 0, out);
+            job.send_rect(x, y, w, h)?;
+            self.lossy.append(&mut job.lossy);
+            return Ok(());
+        }
+
+        // The four streams divided evenly, the last band taking the rest.
+        let mut rest = &mut self.streams[..];
+        let mut jobs = Vec::with_capacity(nt);
+        // The first band writes to `out`, the others to buffers appended
+        // afterwards.
+        let mut outs: Vec<Vec<u8>> = (1..nt).map(|_| Vec::new()).collect();
+        let mut outs_iter = outs.iter_mut();
+        let mut first_out = Some(&mut *out);
+        for i in 0..nt {
+            let base = 4 / nt * i;
+            let n = if i == nt - 1 { 4 - base } else { 4 / nt };
+            let (mine, tail) = rest.split_at_mut(n);
+            rest = tail;
+            let band_out = match first_out.take() {
+                Some(o) => o,
+                None => outs_iter.next().expect("one buffer per band"),
+            };
+            let band_y = h / nt as i32 * i as i32 + y;
+            let band_h = if i == nt - 1 {
+                h - h / nt as i32 * i as i32
+            } else {
+                h / nt as i32
+            };
+            jobs.push((new_job(mine, base, band_out), band_y, band_h));
+        }
+        let mut results: Vec<Result<(), CodecError>> = (0..nt).map(|_| Ok(())).collect();
+        rayon::scope(|s| {
+            for ((job, band_y, band_h), result) in jobs.iter_mut().zip(results.iter_mut()) {
+                s.spawn(move |_| *result = job.send_rect(x, *band_y, w, *band_h));
+            }
+        });
+        for (job, _, _) in &mut jobs {
+            self.lossy.append(&mut job.lossy);
+        }
+        drop(jobs);
+        results.into_iter().collect::<Result<(), _>>()?;
+        for band in outs {
+            out.extend_from_slice(&band);
+        }
+        Ok(())
     }
 }
 
-/// One `encode` call (TurboVNC `threadparam` for a single thread).
+/// One band of an `encode` call (TurboVNC `threadparam`).
 struct Job<'a> {
-    streams: &'a mut [Option<Deflater>; 4],
+    /// This band's share of the zlib streams, starting with stream number
+    /// `base_stream`.
+    streams: &'a mut [Option<Deflater>],
+    base_stream: usize,
     fb: &'a Framebuffer,
     translator: &'a Translator,
     settings: &'a TightSettings,
     conf: &'static Conf,
     client: PixelFormat,
     pf24: bool,
-    /// Next zlib stream, rotating 0-3 and restarting at 0 for each call.
+    /// Next zlib stream (an index into `streams`), rotating and restarting
+    /// at the first for each call.
     stream_id: usize,
     out: &'a mut Vec<u8>,
+    lossy: Vec<Rect>,
+}
+
+/// The byte layout of a 32bpp format with 8-bit channels in whole bytes,
+/// which the JPEG encoder can read directly.
+fn jpeg_layout(f: &PixelFormat) -> Option<Layout> {
+    if f.bpp != 32 || f.max != [255; 3] || f.shift.iter().any(|s| s % 8 != 0) {
+        return None;
+    }
+    let byte = |shift: u8| {
+        let i = usize::from(shift / 8);
+        if f.big_endian { 3 - i } else { i }
+    };
+    match f.shift.map(byte) {
+        [0, 1, 2] => Some(Layout::Rgbx),
+        [2, 1, 0] => Some(Layout::Bgrx),
+        _ => None,
+    }
+}
+
+/// Pixel values of packed client pixels; the common 32bpp case is kept
+/// simple enough to vectorise.
+fn pixel_values(buf: &[u8], format: &PixelFormat) -> Vec<u32> {
+    match (format.bpp, format.big_endian) {
+        (32, false) => buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&p| u32::from_le_bytes(p))
+            .collect(),
+        (32, true) => buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&p| u32::from_be_bytes(p))
+            .collect(),
+        (bpp, big_endian) => buf
+            .chunks_exact(usize::from(bpp / 8))
+            .map(|p| read_pixel(p, big_endian))
+            .collect(),
+    }
 }
 
 fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
@@ -446,10 +590,7 @@ impl Job<'_> {
         let mut buf = Vec::new();
         self.translator.translate_rect(self.fb, r, &mut buf)?;
         let bpp = usize::from(self.client.bpp / 8);
-        let pixels: Vec<u32> = buf
-            .chunks_exact(bpp)
-            .map(|p| read_pixel(p, self.client.big_endian))
-            .collect();
+        let pixels = pixel_values(&buf, &self.client);
 
         match classify(&pixels, max_colours, self.client.bpp != 8) {
             Colours::Full if self.settings.quality.is_some() => self.send_jpeg(r)?,
@@ -461,9 +602,10 @@ impl Job<'_> {
         Ok(())
     }
 
+    /// The stream number for the next zlib-compressed rectangle.
     fn next_stream(&mut self) -> usize {
-        let id = self.stream_id;
-        self.stream_id = (self.stream_id + 1) % 4;
+        let id = self.base_stream + self.stream_id;
+        self.stream_id = (self.stream_id + 1) % self.streams.len();
         id
     }
 
@@ -541,10 +683,10 @@ impl Job<'_> {
         let level = self.conf.raw_zlib_level;
         self.out.put_u8(self.basic_ctl(stream, level, false));
         if self.pf24 {
-            let data: Vec<u8> = pixels
-                .iter()
-                .flat_map(|&p| pack24(&self.client, p))
-                .collect();
+            let mut data = vec![0; pixels.len() * 3];
+            for (d, &p) in data.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+                *d = pack24(&self.client, p);
+            }
             self.compress_data(stream, &data, level);
         } else {
             self.compress_data(stream, buf, level);
@@ -562,7 +704,8 @@ impl Job<'_> {
             self.out.extend_from_slice(data);
             return;
         }
-        let deflater = self.streams[stream].get_or_insert_with(|| Deflater::new(level));
+        let deflater =
+            self.streams[stream - self.base_stream].get_or_insert_with(|| Deflater::new(level));
         let mut compressed = Vec::new();
         deflater.compress(data, level, &mut compressed);
         self.out.put_compact_len(compressed.len());
@@ -575,25 +718,38 @@ impl Job<'_> {
         if format.bpp == 8 {
             let mut buf = Vec::new();
             self.translator.translate_rect(self.fb, r, &mut buf)?;
-            let bpp = usize::from(self.client.bpp / 8);
-            let pixels: Vec<u32> = buf
-                .chunks_exact(bpp)
-                .map(|p| read_pixel(p, self.client.big_endian))
-                .collect();
+            let pixels = pixel_values(&buf, &self.client);
             self.send_full_colour(&buf, &pixels);
             return Ok(());
         }
-        let bpp = self.fb.bytes_per_pixel();
-        let mut rgb = Vec::with_capacity(r.area() as usize * 3);
-        for dy in 0..r.h {
-            for p in self.fb.rect_row(r, dy).chunks_exact(bpp) {
-                rgb.extend_from_slice(&unpack_rgb(format, read_pixel(p, format.big_endian)));
+        let (layout, pixels) = match jpeg_layout(format) {
+            // Rows copied as they are; the encoder reads 32bpp pixels.
+            Some(layout) => {
+                let mut pixels = Vec::with_capacity(r.area() as usize * 4);
+                for dy in 0..r.h {
+                    pixels.extend_from_slice(self.fb.rect_row(r, dy));
+                }
+                (layout, pixels)
             }
-        }
+            None => {
+                let bpp = self.fb.bytes_per_pixel();
+                let mut rgb = Vec::with_capacity(r.area() as usize * 3);
+                for dy in 0..r.h {
+                    for p in self.fb.rect_row(r, dy).chunks_exact(bpp) {
+                        rgb.extend_from_slice(&unpack_rgb(
+                            format,
+                            read_pixel(p, format.big_endian),
+                        ));
+                    }
+                }
+                (Layout::Rgb, rgb)
+            }
+        };
         let mut jpeg_data = Vec::new();
         let quality = self.settings.quality.expect("JPEG only with a quality");
         jpeg::compress(
-            &rgb,
+            &pixels,
+            layout,
             r.w,
             r.h,
             quality,
@@ -604,6 +760,7 @@ impl Job<'_> {
         self.out.put_u8(TIGHT_JPEG << 4);
         self.out.put_compact_len(jpeg_data.len());
         self.out.extend_from_slice(&jpeg_data);
+        self.lossy.push(r);
         Ok(())
     }
 }

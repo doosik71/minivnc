@@ -16,6 +16,7 @@ mod pam;
 mod secconf;
 
 use rfb_auth::Passwords;
+use rfb_codec::jpeg::Subsampling;
 use rfb_server::security::parse_security_types;
 use rfb_server::source::{PngSource, SyntheticSource};
 use rfb_server::{Config, SecurityType, Server, Sharing};
@@ -61,6 +62,17 @@ usage: minivnc-server [:N] [options]
                         how long a dragging viewer keeps the pointer from
                         others (default 3000)
   -noflowcontrol        disable congestion control
+  -nthreads N           threads for Tight encoding, 1-4 (default: the number
+                        of CPUs, at most 4)
+  -nomt                 encode with one thread
+  -interframe           always compare each update with the previous one and
+                        send only the changed 256x256 blocks
+  -nointerframe         never do (default: for compression levels 5 and up)
+  -alr SECS             Automatic Lossless Refresh: resend what went out as
+                        JPEG this long after the last update
+  -alrqual Q            send the refresh as JPEG of quality Q (1-100) instead
+  -alrsamp S            its chroma subsampling: 1X (default), 2X, 4X, Gray
+  -profile              log update statistics every 5 seconds
   -noremoteresize       do not let viewers resize the desktop
   -maxclipboard BYTES   clipboard transfer limit (default 1048576)
   -noclipboardsend      do not send the desktop clipboard to viewers
@@ -93,6 +105,12 @@ struct Options {
     sharing: Sharing,
     pointer_lock_timeout: Duration,
     congestion_control: bool,
+    encoder_threads: usize,
+    interframe: Option<bool>,
+    alr: Option<Duration>,
+    alr_quality: Option<u8>,
+    alr_subsampling: Subsampling,
+    profile: bool,
     remote_resize: bool,
     max_clipboard: usize,
     clipboard_send: bool,
@@ -128,6 +146,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         sharing: Sharing::default(),
         pointer_lock_timeout: config.pointer_lock_timeout,
         congestion_control: true,
+        encoder_threads: config.encoder_threads,
+        interframe: None,
+        alr: None,
+        alr_quality: None,
+        alr_subsampling: Subsampling::S444,
+        profile: false,
         remote_resize: true,
         max_clipboard: config.max_clipboard,
         clipboard_send: true,
@@ -188,6 +212,52 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
             "disconnect" => opts.sharing.disconnect = true,
             "dontdisconnect" => opts.sharing.disconnect = false,
             "noflowcontrol" => opts.congestion_control = false,
+            "nthreads" => {
+                let v = value(&arg)?;
+                let max = rfb_codec::tight::encoder::MAX_THREADS;
+                let n: usize = v
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=max).contains(n))
+                    .ok_or_else(|| format!("bad -nthreads value {v} (1-{max})"))?;
+                // As TurboVNC, no more threads than CPUs.
+                let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+                opts.encoder_threads = n.min(cpus);
+            }
+            "nomt" => opts.encoder_threads = 1,
+            "interframe" => opts.interframe = Some(true),
+            "nointerframe" => opts.interframe = Some(false),
+            "alr" => {
+                let v = value(&arg)?;
+                let secs: f64 = v
+                    .parse()
+                    .ok()
+                    .filter(|s: &f64| s.is_finite() && *s >= 0.0)
+                    .ok_or_else(|| format!("bad -alr value {v}"))?;
+                // 0 turns it off, as in TurboVNC.
+                opts.alr = (secs > 0.0).then(|| Duration::from_secs_f64(secs));
+            }
+            "alrqual" => {
+                let v = value(&arg)?;
+                opts.alr_quality = Some(
+                    v.parse()
+                        .ok()
+                        .filter(|q| (1..=100).contains(q))
+                        .ok_or_else(|| format!("bad -alrqual value {v} (1-100)"))?,
+                );
+            }
+            "alrsamp" => {
+                let v = value(&arg)?;
+                // TurboVNC looks at the first character; 0 is Gray too.
+                opts.alr_subsampling = match v.chars().next().map(|c| c.to_ascii_uppercase()) {
+                    Some('1') => Subsampling::S444,
+                    Some('2') => Subsampling::S422,
+                    Some('4') => Subsampling::S420,
+                    Some('G' | '0') => Subsampling::Gray,
+                    _ => return Err(format!("bad -alrsamp value {v} (1X, 2X, 4X, Gray)")),
+                };
+            }
+            "profile" => opts.profile = true,
             "noremoteresize" => opts.remote_resize = false,
             "maxclipboard" => {
                 opts.max_clipboard = value(&arg)?.parse().map_err(|_| "bad -maxclipboard")?
@@ -308,6 +378,12 @@ async fn run(opts: Options) -> std::io::Result<()> {
         sharing: opts.sharing,
         pointer_lock_timeout: opts.pointer_lock_timeout,
         congestion_control: opts.congestion_control,
+        encoder_threads: opts.encoder_threads,
+        interframe: opts.interframe,
+        alr: opts.alr,
+        alr_quality: opts.alr_quality,
+        alr_subsampling: opts.alr_subsampling,
+        profile: opts.profile,
         remote_resize: opts.remote_resize && !conf.no_remote_resize,
         max_desktop_size: conf.max_desktop_size,
         max_clipboard: opts.max_clipboard,
@@ -419,6 +495,35 @@ mod tests {
         assert_eq!(o.desktop, "test");
         assert!(parse(&["-securitytypes", "Bogus"]).is_err());
         assert!(parse(&["-securitytypes", ","]).is_err());
+    }
+
+    #[test]
+    fn performance_options() {
+        let o = parse(&[
+            "-nthreads",
+            "2",
+            "-interframe",
+            "-alr",
+            "0.5",
+            "-alrqual",
+            "90",
+            "-alrsamp",
+            "gray",
+            "-profile",
+        ])
+        .unwrap();
+        assert!((1..=2).contains(&o.encoder_threads));
+        assert_eq!(o.interframe, Some(true));
+        assert_eq!(o.alr, Some(Duration::from_millis(500)));
+        assert_eq!(o.alr_quality, Some(90));
+        assert_eq!(o.alr_subsampling, Subsampling::Gray);
+        assert!(o.profile);
+        assert_eq!(parse(&["-nomt"]).unwrap().encoder_threads, 1);
+        assert_eq!(parse(&["-alr", "0"]).unwrap().alr, None);
+        assert_eq!(parse(&["-nointerframe"]).unwrap().interframe, Some(false));
+        for bad in [["-nthreads", "5"], ["-alrqual", "0"], ["-alrsamp", "3X"]] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

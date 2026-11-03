@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rfb_client::{Client, ClientError, CursorShape, Stream};
+use rfb_proto::Rect;
 use rfb_proto::consts::{EDS_REASON_CLIENT, LED_CAPS_LOCK, LED_NUM_LOCK, LED_SCROLL_LOCK};
 use rfb_proto::msg::{ClientMessage, Screen as ScreenDesc};
 use softbuffer::Surface;
@@ -23,7 +24,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
 use crate::conn::{self, Notice, SharedClipboard, SharedScreen, Writer};
@@ -126,6 +127,11 @@ struct App {
     pressed: HashMap<PhysicalKey, SentKey>,
     /// Wheel movement not yet sent, in clicks.
     wheel: (f64, f64),
+    /// The SetEncodings list, and the lossless one sent for a lossless
+    /// refresh (`None` if the settings are lossless already).
+    encodings: Vec<i32>,
+    lossless_encodings: Option<Vec<i32>>,
+    modifiers: ModifiersState,
     /// Server extensions confirmed so far.
     qemu_keys: bool,
     ext_mouse_buttons: bool,
@@ -233,6 +239,30 @@ impl App {
         // A broken connection also ends the RFB thread, which reports it.
         if let Err(e) = self.writer.send(&msg) {
             debug!("send failed: {e}");
+        }
+    }
+
+    /// TurboVNC `CConn.losslessRefresh`: switch to lossless Tight (CL 1, no
+    /// JPEG), ask for the whole screen, and switch back.
+    fn lossless_refresh(&self) {
+        info!("requesting a lossless refresh");
+        let refresh = ClientMessage::FramebufferUpdateRequest {
+            incremental: false,
+            rect: Rect::new(0, 0, self.remote.0 as u16, self.remote.1 as u16),
+        };
+        let result = match &self.lossless_encodings {
+            Some(lossless) => self
+                .writer
+                .send(&ClientMessage::SetEncodings(lossless.clone()))
+                .and_then(|()| self.writer.send(&refresh))
+                .and_then(|()| {
+                    self.writer
+                        .send(&ClientMessage::SetEncodings(self.encodings.clone()))
+                }),
+            None => self.writer.send(&refresh),
+        };
+        if let Err(e) = result {
+            debug!("lossless refresh: {e}");
         }
     }
 
@@ -632,6 +662,22 @@ impl ApplicationHandler<UserEvent> for App {
             // Keys released while another window has the focus would
             // otherwise stay pressed on the server.
             WindowEvent::Focused(false) => self.release_all_keys(),
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            // TurboVNC viewer hot key: Ctrl+Alt+Shift+L asks for a lossless
+            // refresh; the L is not sent.
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if event.physical_key == PhysicalKey::Code(KeyCode::KeyL)
+                && self.modifiers.control_key()
+                && self.modifiers.alt_key()
+                && self.modifiers.shift_key() =>
+            {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    self.lossless_refresh();
+                }
+            }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: false,
@@ -742,6 +788,8 @@ pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(),
     let damage_pending = Arc::new(AtomicBool::new(false));
 
     let encodings = opts.encodings();
+    let lossless_encodings = opts.lossless().map(|o| o.encodings());
+    let app_encodings = encodings.clone();
     let thread_screen = screen.clone();
     let thread_clipboard = Arc::clone(&clipboard);
     let pending = Arc::clone(&damage_pending);
@@ -787,6 +835,9 @@ pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(),
         dragging: None,
         pressed: HashMap::new(),
         wheel: (0.0, 0.0),
+        encodings: app_encodings,
+        lossless_encodings,
+        modifiers: ModifiersState::empty(),
         qemu_keys: false,
         ext_mouse_buttons: false,
         remote_resize: false,

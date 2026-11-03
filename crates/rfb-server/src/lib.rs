@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use rfb_auth::Passwords;
 use rfb_codec::Framebuffer;
+use rfb_codec::jpeg::Subsampling;
 use rfb_proto::consts::{EDS_RESULT_PROHIBITED, LED_UNKNOWN};
 use rfb_proto::msg::DEFAULT_MAX_CUT_TEXT;
 use rfb_region::Region;
@@ -192,6 +193,21 @@ pub struct Config {
     pub pointer_lock_timeout: Duration,
     /// TCP Vegas-style congestion control for clients with fences.
     pub congestion_control: bool,
+    /// Threads for Tight encoding, 1-4 (TurboVNC `-nthreads`; by default
+    /// the number of CPUs, at most 4).
+    pub encoder_threads: usize,
+    /// Interframe comparison (TurboVNC `-interframe`/`-nointerframe`);
+    /// `None` turns it on for clients asking for compression levels 5-8.
+    pub interframe: Option<bool>,
+    /// Automatic Lossless Refresh this long after the last update
+    /// (TurboVNC `-alr`).
+    pub alr: Option<Duration>,
+    /// JPEG quality and subsampling of the refresh (`-alrqual`,
+    /// `-alrsamp`); `None` is lossless.
+    pub alr_quality: Option<u8>,
+    pub alr_subsampling: Subsampling,
+    /// Log each client's update statistics every 5 seconds (`-profile`).
+    pub profile: bool,
     /// Let clients resize the desktop (TurboVNC `no-remote-resize` off).
     pub remote_resize: bool,
     /// Largest size clients may resize the desktop to (TurboVNC
@@ -224,6 +240,14 @@ impl Default for Config {
             sharing: Sharing::default(),
             pointer_lock_timeout: Duration::from_millis(3000),
             congestion_control: true,
+            encoder_threads: std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(rfb_codec::tight::encoder::MAX_THREADS),
+            interframe: None,
+            alr: None,
+            alr_quality: None,
+            alr_subsampling: Subsampling::S444,
+            profile: false,
             remote_resize: true,
             max_desktop_size: None,
             max_clipboard: DEFAULT_MAX_CUT_TEXT,

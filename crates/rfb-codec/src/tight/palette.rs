@@ -3,8 +3,6 @@
 //! order) and the counts themselves follow the C code exactly, because they
 //! determine the bytes on the wire.
 
-use std::collections::HashMap;
-
 /// How a rectangle's pixels should be encoded.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Colours {
@@ -18,11 +16,26 @@ pub(crate) enum Colours {
     Full,
 }
 
+/// Slots in the colour index: a power of two, twice the most colours.
+const INDEX_SLOTS: usize = 512;
+const EMPTY: u16 = u16::MAX;
+
 /// Colours sorted by pixel count, most frequent first.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Palette {
     entries: Vec<(u32, u32)>,
-    index: HashMap<u32, usize>,
+    /// Open-addressing table of (colour, position in `entries`). A general
+    /// purpose hash map made colour counting the encoder's hot spot.
+    index: Box<[(u32, u16)]>,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(256),
+            index: vec![(0, EMPTY); INDEX_SLOTS].into_boxed_slice(),
+        }
+    }
 }
 
 impl Palette {
@@ -35,27 +48,49 @@ impl Palette {
     }
 
     pub(crate) fn index_of(&self, colour: u32) -> u8 {
-        self.index[&colour] as u8
+        self.index[self.slot(colour)].1 as u8
+    }
+
+    /// The slot holding `colour`, or the empty one where it would go.
+    fn slot(&self, colour: u32) -> usize {
+        let mut i = (colour.wrapping_mul(0x9E37_79B1) >> 23) as usize;
+        loop {
+            let (c, pos) = self.index[i];
+            if pos == EMPTY || c == colour {
+                return i;
+            }
+            i = (i + 1) % INDEX_SLOTS;
+        }
+    }
+
+    fn get(&self, colour: u32) -> Option<usize> {
+        let (_, pos) = self.index[self.slot(colour)];
+        (pos != EMPTY).then_some(usize::from(pos))
     }
 
     fn reindex(&mut self, from: usize, to: usize) {
         for i in from..=to {
-            self.index.insert(self.entries[i].0, i);
+            let colour = self.entries[i].0;
+            let slot = self.slot(colour);
+            self.index[slot] = (colour, i as u16);
         }
     }
 
     /// Adds `n` pixels of `colour`. Returns `false` when a new colour does not
     /// fit (`max` reached or 256 colours).
     fn insert(&mut self, colour: u32, n: u32, max: usize) -> bool {
-        if let Some(&idx) = self.index.get(&colour) {
+        if let Some(idx) = self.get(colour) {
             let count = self.entries[idx].1 + n;
             let mut new_idx = idx;
             while new_idx > 0 && self.entries[new_idx - 1].1 < count {
                 new_idx -= 1;
             }
-            self.entries.remove(idx);
-            self.entries.insert(new_idx, (colour, count));
-            self.reindex(new_idx, idx);
+            self.entries[idx].1 = count;
+            if new_idx != idx {
+                // Move it up past the entries with fewer pixels.
+                self.entries[new_idx..=idx].rotate_right(1);
+                self.reindex(new_idx, idx);
+            }
             return true;
         }
         if self.entries.len() == 256 || self.entries.len() == max {

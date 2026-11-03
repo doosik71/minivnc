@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rfb_auth::Access;
-use rfb_codec::tight::TightEncoder;
-use rfb_codec::{Translator, clipboard, raw};
+use rfb_codec::tight::{TightEncoder, TightSettings};
+use rfb_codec::{Framebuffer, Translator, clipboard, raw};
 use rfb_proto::consts::*;
 use rfb_proto::msg::{
     ClientMessage, ClientParseCtx, CutText, RectHeader, Screen as ScreenDesc, ServerMessage,
@@ -38,6 +38,59 @@ const FENCE_INITIAL: u8 = 0;
 const FENCE_RTT: u8 = 1;
 /// The only screen of the desktop.
 const SCREEN_ID: u32 = 0;
+/// TurboVNC `rfbInterframeBlockSize`.
+const INTERFRAME_BLOCK: u16 = 256;
+/// How often `-profile` statistics are logged.
+const PROFILE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// TurboVNC `-profile` statistics since the last report.
+struct Profile {
+    start: Instant,
+    updates: u32,
+    pixels: u64,
+    bytes: u64,
+    /// Time spent producing and writing updates, and only producing them.
+    busy: Duration,
+    encoding: Duration,
+}
+
+impl Profile {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            updates: 0,
+            pixels: 0,
+            bytes: 0,
+            busy: Duration::ZERO,
+            encoding: Duration::ZERO,
+        }
+    }
+
+    fn record(&mut self, id: u64, pixels: u64, bytes: usize, busy: Duration, encoding: Duration) {
+        self.updates += 1;
+        self.pixels += pixels;
+        self.bytes += bytes as u64;
+        self.busy += busy;
+        self.encoding += encoding;
+        let elapsed = self.start.elapsed();
+        if elapsed < PROFILE_INTERVAL {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        let per_update = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(self.updates);
+        info!(
+            client = id,
+            "{:.2} updates/sec, {:.2} Mpixels/sec, {:.3} Mbits/sec; time/update: encode = {:.3} ms (without writing {:.3} ms), other = {:.3} ms",
+            f64::from(self.updates) / secs,
+            self.pixels as f64 / 1e6 / secs,
+            self.bytes as f64 * 8.0 / 1e6 / secs,
+            per_update(self.busy),
+            per_update(self.encoding),
+            per_update(elapsed.saturating_sub(self.busy)),
+        );
+        *self = Self::new();
+    }
+}
 
 pub(crate) async fn run(
     stream: TcpStream,
@@ -198,6 +251,16 @@ struct Session<'a> {
     congestion_deadline: Option<tokio::time::Instant>,
     congestion: Congestion,
     tight: TightEncoder,
+    /// A copy of what the client was last sent, for interframe comparison;
+    /// `first_compare` makes the next comparison find everything changed.
+    compare: Option<Framebuffer>,
+    first_compare: bool,
+    /// Areas the client last got as JPEG (Automatic Lossless Refresh).
+    lossy: Region,
+    alr_deadline: Option<tokio::time::Instant>,
+    /// An Automatic Lossless Refresh is being sent.
+    in_alr: bool,
+    profile: Option<Profile>,
     /// Changed areas not yet sent.
     modified: Region,
     /// Areas the client asked for and has not received yet.
@@ -248,7 +311,13 @@ impl<'a> Session<'a> {
             defer_deadline: None,
             congestion_deadline: None,
             congestion: Congestion::new(Instant::now()),
-            tight: TightEncoder::new(),
+            tight: TightEncoder::with_threads(shared.config.encoder_threads),
+            compare: None,
+            first_compare: false,
+            lossy: Region::new(),
+            alr_deadline: None,
+            in_alr: false,
+            profile: shared.config.profile.then(Profile::new),
             modified: Region::new(),
             requested: Region::new(),
             bounds,
@@ -272,6 +341,9 @@ impl<'a> Session<'a> {
 
     async fn run(mut self, kick: &Notify) -> io::Result<()> {
         let mut updates = self.shared.updates.subscribe();
+        if self.shared.config.interframe == Some(true) {
+            self.set_interframe(true);
+        }
         loop {
             while let Some(msg) = self
                 .conn
@@ -288,10 +360,14 @@ impl<'a> Session<'a> {
                     self.send_update().await?;
                 }
             }
-            let deadline = [self.defer_deadline, self.congestion_deadline]
-                .into_iter()
-                .flatten()
-                .min();
+            let deadline = [
+                self.defer_deadline,
+                self.congestion_deadline,
+                self.alr_deadline,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let timer = async move {
                 match deadline {
                     Some(d) => tokio::time::sleep_until(d).await,
@@ -310,13 +386,22 @@ impl<'a> Session<'a> {
                 }
                 () = timer => {
                     let now = tokio::time::Instant::now();
+                    let mut due = false;
                     if self.defer_deadline.is_some_and(|d| d <= now) {
                         self.defer_deadline = None;
+                        due = true;
                     }
                     if self.congestion_deadline.is_some_and(|d| d <= now) {
                         self.congestion_deadline = None;
+                        due = true;
                     }
-                    self.send_update().await?;
+                    if self.alr_deadline.is_some_and(|d| d <= now) {
+                        self.alr_deadline = None;
+                        self.auto_lossless_refresh().await?;
+                    }
+                    if due {
+                        self.send_update().await?;
+                    }
                 }
                 () = kick.notified() => {
                     info!(client = self.id, "disconnected by a non-shared client");
@@ -365,6 +450,11 @@ impl<'a> Session<'a> {
     fn resized(&mut self, by: Option<u64>) {
         let fb = self.shared.screen().plain.bounds();
         self.bounds = Region::from(to_region_rect(fb));
+        self.lossy = self.lossy.intersect(&self.bounds);
+        if self.compare.is_some() {
+            self.set_interframe(false);
+            self.set_interframe(true);
+        }
         self.modified = self.bounds.clone();
         self.requested = self.requested.intersect(&self.bounds);
         if let Some(cu) = &mut self.cu_region {
@@ -403,9 +493,90 @@ impl<'a> Session<'a> {
             || self.pending_mouse_rect
     }
 
+    /// TurboVNC `InterframeOn`/`InterframeOff`.
+    fn set_interframe(&mut self, on: bool) {
+        if !on {
+            self.compare = None;
+        } else if self.compare.is_none() {
+            let screen = self.shared.screen();
+            let fb = &screen.plain;
+            self.compare = Some(Framebuffer::new(fb.width(), fb.height(), *fb.format()));
+            self.first_compare = true;
+        }
+    }
+
+    /// TurboVNC interframe comparison: the 256x256 blocks of `update` that
+    /// differ from the copy of what the client last got, which is brought
+    /// up to date.
+    fn interframe(&mut self, fb: &Framebuffer, update: &Region) -> Region {
+        let first = std::mem::take(&mut self.first_compare);
+        let compare = self.compare.as_mut().expect("interframe comparison is on");
+        let mut changed = Region::new();
+        for r in update.rects().iter().map(to_wire_rect) {
+            for by in (0..r.h).step_by(INTERFRAME_BLOCK.into()) {
+                for bx in (0..r.w).step_by(INTERFRAME_BLOCK.into()) {
+                    let block = Rect::new(
+                        r.x + bx,
+                        r.y + by,
+                        INTERFRAME_BLOCK.min(r.w - bx),
+                        INTERFRAME_BLOCK.min(r.h - by),
+                    );
+                    let mut different = false;
+                    for dy in 0..block.h {
+                        let row = fb.rect_row(block, dy);
+                        if first || compare.rect_row(block, dy) != row {
+                            let line = Rect::new(block.x, block.y + dy, block.w, 1);
+                            compare
+                                .put_rect(line, row)
+                                .expect("same size as the screen");
+                            different = true;
+                        }
+                    }
+                    if different {
+                        changed = changed.union(&Region::from(to_region_rect(block)));
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// TurboVNC `alrCallback`: sends again what went out as JPEG, with
+    /// compression level 1 and the ALR quality, whether or not the client
+    /// asked and despite congestion.
+    async fn auto_lossless_refresh(&mut self) -> io::Result<()> {
+        let region = self.lossy.intersect(&self.bounds);
+        if region.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            client = self.id,
+            rects = region.num_rects(),
+            "automatic lossless refresh"
+        );
+        let modified = std::mem::replace(&mut self.modified, region.clone());
+        let requested = std::mem::replace(&mut self.requested, region);
+        self.in_alr = true;
+        let result = self.send_update().await;
+        self.in_alr = false;
+        self.lossy = Region::new();
+        self.modified = modified;
+        self.requested = requested;
+        result
+    }
+
     fn set_encodings(&mut self, encodings: &[i32]) -> SetEncodingsActions {
         let before = self.ext;
         self.prefs.apply(encodings);
+        // As TurboVNC, automatic interframe comparison follows each
+        // compression level the client sets.
+        if self.shared.config.interframe.is_none()
+            && encodings
+                .iter()
+                .any(|e| (ENCODING_COMPRESS_LEVEL0..=ENCODING_COMPRESS_LEVEL9).contains(e))
+        {
+            self.set_interframe(self.prefs.tight.compress_level >= 5);
+        }
         let remote_resize = self.shared.config.remote_resize;
         // Cursor shape and position updates are re-read every time; the
         // other extensions stay on once seen, as in TurboVNC.
@@ -774,7 +945,7 @@ impl<'a> Session<'a> {
         if self.syncing {
             return Ok(());
         }
-        if self.shared.config.congestion_control && self.ext.fence {
+        if self.shared.config.congestion_control && self.ext.fence && !self.in_alr {
             let now = Instant::now();
             if let Some(wait) = self.congestion.congested(now, self.conn.sent) {
                 self.congestion_deadline = Some(tokio::time::Instant::now() + wait);
@@ -817,6 +988,66 @@ impl<'a> Session<'a> {
         update.collapse_if_over(COMBINE_RECT);
 
         self.ping().await?;
+        let started = Instant::now();
+
+        let (out, pixels, redundant) =
+            self.encode_update(update, send_cursor, send_pointer, num_pseudo)?;
+        let encoding = started.elapsed();
+        self.conn.write(&out).await?;
+        if let Some(profile) = &mut self.profile {
+            profile.record(self.id, pixels, out.len(), started.elapsed(), encoding);
+        }
+        if let Some(alr) = self.shared.config.alr
+            && !redundant
+            && !self.in_alr
+        {
+            // Not sooner than 1.5 round trips, to avoid thrashing.
+            let wait = self
+                .congestion
+                .rtt()
+                .map_or(alr, |rtt| alr.max(rtt.mul_f64(1.5)));
+            self.alr_deadline = Some(tokio::time::Instant::now() + wait);
+        }
+        self.ping().await
+    }
+
+    /// The screen-locked part of `send_update`: interframe comparison and
+    /// encoding. Returns the update message, the pixels it covers, and
+    /// whether interframe comparison found nothing changed.
+    fn encode_update(
+        &mut self,
+        mut update: Region,
+        send_cursor: bool,
+        send_pointer: bool,
+        num_pseudo: u32,
+    ) -> io::Result<(Vec<u8>, u64, bool)> {
+        let shared = self.shared;
+        let screen = shared.screen();
+        let fb = if self.uses_cursor_shape() {
+            &screen.plain
+        } else {
+            &screen.drawn
+        };
+        let mut redundant = false;
+        if self.compare.is_some() && !self.in_alr {
+            update = self.interframe(fb, &update);
+            // TurboVNC: some viewers stop asking after an empty update.
+            if update.is_empty() {
+                update = Region::from(rfb_region::Rect::from_xywh(0, 0, 1, 1));
+                redundant = true;
+            }
+        }
+        let settings = if self.in_alr {
+            let config = &self.shared.config;
+            TightSettings {
+                compress_level: 1,
+                quality: config.alr_quality,
+                subsampling: config.alr_subsampling,
+                ..self.prefs.tight
+            }
+        } else {
+            self.prefs.tight
+        };
 
         let rects: Vec<Rect> = update.rects().iter().map(to_wire_rect).collect();
         let tight = self.prefs.preferred == ENCODING_TIGHT;
@@ -825,21 +1056,20 @@ impl<'a> Session<'a> {
         let count: Option<u32> = if tight {
             rects
                 .iter()
-                .map(|&r| TightEncoder::num_rects(&self.prefs.tight, r))
+                .map(|&r| TightEncoder::num_rects(&settings, r))
                 .sum()
         } else {
             Some(rects.len() as u32)
         };
         let num_rects = match count.map(|n| u16::try_from(n + num_pseudo)) {
             Some(Ok(n)) if n != 0xFFFF => n,
-            _ if self.prefs.tight.last_rect => 0xFFFF,
+            _ if settings.last_rect => 0xFFFF,
             _ => return Err(io::Error::other("update has too many rectangles")),
         };
 
         let mut out = Vec::new();
         write_framebuffer_update_header(&mut out, num_rects);
         {
-            let screen = self.shared.screen();
             if send_cursor {
                 self.cursor_changed = false;
                 write_cursor(
@@ -870,19 +1100,24 @@ impl<'a> Session<'a> {
             if std::mem::take(&mut self.pending_mouse_rect) {
                 pseudo_rect(&mut out, Rect::default(), ENCODING_EXTENDED_MOUSE_BUTTONS);
             }
-            let fb = if self.uses_cursor_shape() {
-                &screen.plain
-            } else {
-                &screen.drawn
-            };
             for &r in &rects {
                 if tight {
                     self.tight
-                        .encode(fb, r, &self.translator, &self.prefs.tight, &mut out)
+                        .encode(fb, r, &self.translator, &settings, &mut out)
                 } else {
                     raw::encode(fb, r, &self.translator, &mut out)
                 }
                 .map_err(io::Error::other)?;
+            }
+            if self.shared.config.alr.is_some() {
+                let jpeg = self
+                    .tight
+                    .take_lossy()
+                    .into_iter()
+                    .fold(Region::new(), |r, j| {
+                        r.union(&Region::from(to_region_rect(j)))
+                    });
+                self.lossy = self.lossy.subtract(&update).union(&jpeg);
             }
         }
         if num_rects == 0xFFFF {
@@ -894,8 +1129,8 @@ impl<'a> Session<'a> {
             bytes = out.len(),
             "framebuffer update"
         );
-        self.conn.write(&out).await?;
-        self.ping().await
+        let pixels = rects.iter().map(|r| u64::from(r.area())).sum();
+        Ok((out, pixels, redundant))
     }
 
     async fn send_clipboard(&mut self, flags: u32, data: Vec<u8>) -> io::Result<()> {

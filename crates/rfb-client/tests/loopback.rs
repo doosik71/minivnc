@@ -1234,3 +1234,76 @@ fn tls_security_types() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn area(rects: &[Rect]) -> u32 {
+    rects.iter().map(|r| r.area()).sum()
+}
+
+#[test]
+fn interframe_comparison_skips_unchanged_blocks() {
+    // (server setting, client compression level, unchanged screen culled)
+    for (interframe, cl, culled) in [
+        (Some(true), 1, true),
+        (None, 6, true),
+        (None, 9, true),
+        (None, 1, false),
+        (Some(false), 6, false),
+    ] {
+        let config = Config {
+            interframe,
+            ..no_auth(Config::default())
+        };
+        let addr = start_with(Pattern, config, None);
+        let mut client = connect(addr, None).unwrap();
+        client
+            .set_encodings(&[
+                ENCODING_TIGHT,
+                ENCODING_LAST_RECT,
+                ENCODING_COMPRESS_LEVEL0 + cl,
+            ])
+            .unwrap();
+        client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+        assert_eq!(area(&next_update(&mut client)), u32::from(W) * u32::from(H));
+        // Asking for everything again: only a 1x1 rectangle if nothing
+        // changed, as TurboVNC sends.
+        client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+        let again = next_update(&mut client);
+        if culled {
+            assert_eq!(again, [Rect::new(0, 0, 1, 1)], "{interframe:?} CL {cl}");
+        } else {
+            assert_eq!(area(&again), u32::from(W) * u32::from(H));
+        }
+    }
+}
+
+#[test]
+fn automatic_lossless_refresh_replaces_jpeg() {
+    let config = Config {
+        alr: Some(Duration::from_millis(200)),
+        ..no_auth(Config::default())
+    };
+    let addr = start_with(Pattern, config, None);
+    let mut client = connect(addr, None).unwrap();
+    client
+        .set_encodings(&[
+            ENCODING_TIGHT,
+            ENCODING_LAST_RECT,
+            ENCODING_COMPRESS_LEVEL0 + 1,
+            ENCODING_FINE_QUALITY_LEVEL0 + 30,
+            ENCODING_SUBSAMP_2X,
+        ])
+        .unwrap();
+    // The noise area goes out as JPEG.
+    let noise_exact = |c: &Client<Stream>| {
+        (0..64).all(|x| {
+            (0..48).all(|y| c.framebuffer().pixel(x, y) == pack_rgb(&RGB888, pattern_rgb(x, y)))
+        })
+    };
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    next_update(&mut client);
+    assert!(!noise_exact(&client), "JPEG quality 30 is lossy");
+    // The refresh comes without a request, and is lossless.
+    let refresh = next_update(&mut client);
+    assert!(area(&refresh) >= 64 * 48);
+    assert!(noise_exact(&client));
+}

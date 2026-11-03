@@ -427,3 +427,79 @@ proptest! {
         let _ = decoder.decode(&mut Cursor::new(&input), Rect::new(0, 0, w, h), &mut fb);
     }
 }
+
+/// A smooth image that Tight sends as JPEG (or full colour without JPEG).
+fn gradient(w: u16, h: u16, phase: u16) -> Framebuffer {
+    let mut fb = Framebuffer::new(w, h, RGB888);
+    for y in 0..h {
+        for x in 0..w {
+            let c = [(x + y + phase) as u8, (x * 2) as u8, (y * 2 + phase) as u8];
+            fb.fill_rect(Rect::new(x, y, 1, 1), pack_rgb(&RGB888, c))
+                .unwrap();
+        }
+    }
+    fb
+}
+
+#[test]
+fn threaded_bands_round_trip() {
+    // 640x480 is 4.7 maximum subrectangles: four bands. Several frames
+    // check that each band keeps to its own zlib streams.
+    let t = Translator::new(&RGB888, &RGB888).unwrap();
+    let mut encoder = TightEncoder::with_threads(4);
+    let mut decoder = TightDecoder::new();
+    let mut fb = Framebuffer::new(640, 480, RGB888);
+    for (phase, cl) in [(0, 1), (3, 6), (7, 9), (11, 0)] {
+        let img = Image {
+            w: 640,
+            h: 480,
+            background: [phase as u8, 20, 30],
+            blocks: vec![
+                (
+                    Rect::new(10, 30, 600, 400),
+                    vec![[1, 2, 3], [4, 5, 6], [7, 8, phase as u8]],
+                ),
+                (Rect::new(100, 50, 300, 300), vec![[200, 0, 0], [0, 200, 0]]),
+            ],
+        };
+        let mut server = render(&img);
+        // Full-colour content too, so the raw zlib streams are used.
+        let photo = gradient(640, 100, phase);
+        for y in 0..100 {
+            let r = Rect::new(0, y, 640, 1);
+            server
+                .put_rect(Rect::new(0, 380 + y, 640, 1), photo.rect_row(r, 0))
+                .unwrap();
+        }
+        let mut out = Vec::new();
+        let s = settings(cl, true, false);
+        encoder
+            .encode(&server, server.bounds(), &t, &s, &mut out)
+            .unwrap();
+        decode_all(&mut decoder, &out, &mut fb);
+        assert_eq!(fb.data(), server.data(), "phase {phase}");
+        assert!(encoder.take_lossy().is_empty());
+    }
+}
+
+#[test]
+fn jpeg_rectangles_are_reported_lossy() {
+    let server = gradient(640, 480, 0);
+    let t = Translator::new(&RGB888, &RGB888).unwrap();
+    for threads in [1, 4] {
+        let mut encoder = TightEncoder::with_threads(threads);
+        let s = TightSettings {
+            quality: Some(80),
+            last_rect: true,
+            ..TightSettings::default()
+        };
+        let mut out = Vec::new();
+        encoder
+            .encode(&server, server.bounds(), &t, &s, &mut out)
+            .unwrap();
+        let lossy = encoder.take_lossy();
+        let area: u32 = lossy.iter().map(|r| r.area()).sum();
+        assert_eq!(area, 640 * 480, "{threads} threads");
+        assert!(encoder.take_lossy().is_empty());
+    }
+}

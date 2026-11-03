@@ -47,6 +47,10 @@ impl Segment {
         unsafe { libc::shmctl(self.id, libc::IPC_RMID, std::ptr::null_mut()) };
     }
 
+    pub(super) fn size(&self) -> usize {
+        self.size
+    }
+
     /// The first `len` bytes. Only read after the X server's reply to a
     /// request that wrote them, so nothing writes concurrently.
     pub(super) fn bytes(&self, len: usize) -> &[u8] {

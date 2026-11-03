@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 capture-x11 = { path = "../../crates/capture-x11" }
 rfb-auth = { path = "../../crates/rfb-auth" }
+rfb-codec = { version = "0.1.0", path = "../../crates/rfb-codec" }
 rfb-proto = { path = "../../crates/rfb-proto" }
 rfb-server = { path = "../../crates/rfb-server" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net"] }

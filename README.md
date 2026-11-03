@@ -70,7 +70,7 @@ minivnc/
 요구 사항:
 - Rust stable (1.88 이상)
 - C 컴파일러: zlib을 소스에서 정적 빌드합니다(Windows는 MSVC, Linux는 gcc/clang).
-- 선택: libjpeg-turbo JPEG 백엔드(`--features rfb-codec/turbojpeg`)를 쓰려면 CMake와 NASM이 필요합니다. 기본 JPEG 백엔드는 순수 Rust입니다.
+- JPEG: Linux에서는 TurboVNC처럼 libjpeg-turbo 3을 씁니다. 크레이트에 든 소스를 정적으로 빌드하므로 CMake와 NASM이 필요합니다(`sudo apt install cmake nasm`; 배포판의 libjpeg-turbo 2.x에는 TurboJPEG 3 API가 없습니다). Windows 기본은 순수 Rust이고, `--features rfb-codec/turbojpeg`로 libjpeg-turbo를 쓸 수 있습니다(CMake와 NASM 필요).
 - Linux X11 서버는 순수 Rust X 프로토콜 구현(x11rb)을 쓰므로 X11 개발 헤더가 필요 없습니다. X 서버에는 MIT-SHM(없으면 느린 GetImage 사용), DAMAGE, XTEST, XKEYBOARD 확장이 있어야 합니다.
 - 뷰어는 winit + softbuffer로 그리며 빌드에 추가 시스템 패키지가 필요 없습니다. Linux에서는 실행할 때 X11(또는 Wayland)과 libxkbcommon 라이브러리를 불러옵니다.
 - TLS(VeNCrypt)는 OpenSSL을 씁니다.
@@ -79,7 +79,7 @@ minivnc/
 
 ```sh
 cargo build --release
-cargo build --release --workspace --features rfb-codec/turbojpeg   # libjpeg-turbo 사용
+cargo build --release --workspace --features rfb-codec/turbojpeg   # Windows에서 libjpeg-turbo 사용
 ```
 
 ## 현재 시험해 볼 수 있는 것 (M6)

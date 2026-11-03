@@ -1,0 +1,17 @@
+[package]
+name = "rfb-bench"
+description = "Measure RFB update throughput, or decoding on a recorded session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+openssl = "0.10.82"
+rfb-auth = { path = "../../crates/rfb-auth" }
+rfb-client = { path = "../../crates/rfb-client" }
+rfb-proto = { path = "../../crates/rfb-proto" }
+
+[lints]
+workspace = true

@@ -35,10 +35,23 @@ use super::{Display, xerr};
 /// How often the pointer position is polled.
 const POINTER_POLL: Duration = Duration::from_millis(10);
 
+fn region_of(r: x11rb::protocol::xproto::Rectangle) -> Region {
+    Region::from(rfb_region::Rect::from_xywh(
+        r.x.into(),
+        r.y.into(),
+        r.width.into(),
+        r.height.into(),
+    ))
+}
+
 pub struct X11Source {
     conn: RustConnection,
     display: Display,
     damage: damage::Damage,
+    /// With XFIXES, damage is reported once until cleared and read through
+    /// this region, so that clients drawing many small things do not flood
+    /// the capture with events. Without it, each change is an event.
+    damage_region: Option<xfixes::Region>,
     shm: Option<(shm::Seg, Segment)>,
     cursor_ok: bool,
     pointer: (u16, u16),
@@ -68,13 +81,31 @@ impl X11Source {
         {
             return Err(io::Error::other("X server lacks the DAMAGE extension"));
         }
+        let cursor_ok = conn
+            .extension_information(xfixes::X11_EXTENSION_NAME)
+            .map_err(xerr)?
+            .is_some()
+            && conn
+                .xfixes_query_version(4, 0)
+                .map_err(xerr)?
+                .reply()
+                .is_ok();
         conn.damage_query_version(1, 1)
             .map_err(xerr)?
             .reply()
             .map_err(xerr)?;
         let damage = conn.generate_id().map_err(xerr)?;
-        conn.damage_create(damage, root, ReportLevel::DELTA_RECTANGLES)
-            .map_err(xerr)?;
+        let damage_region = if cursor_ok {
+            let region = conn.generate_id().map_err(xerr)?;
+            conn.xfixes_create_region(region, &[]).map_err(xerr)?;
+            conn.damage_create(damage, root, ReportLevel::NON_EMPTY)
+                .map_err(xerr)?;
+            Some(region)
+        } else {
+            conn.damage_create(damage, root, ReportLevel::DELTA_RECTANGLES)
+                .map_err(xerr)?;
+            None
+        };
         // Screen size changes arrive as ConfigureNotify on the root window,
         // one-time passwords as a change of its VNC_OTP property.
         conn.change_window_attributes(
@@ -85,15 +116,6 @@ impl X11Source {
         .map_err(xerr)?;
         let otp_atom = super::otp_atom(&conn)?;
 
-        let cursor_ok = conn
-            .extension_information(xfixes::X11_EXTENSION_NAME)
-            .map_err(xerr)?
-            .is_some()
-            && conn
-                .xfixes_query_version(4, 0)
-                .map_err(xerr)?
-                .reply()
-                .is_ok();
         if cursor_ok {
             conn.xfixes_select_cursor_input(root, CursorNotifyMask::DISPLAY_CURSOR)
                 .map_err(xerr)?;
@@ -120,6 +142,7 @@ impl X11Source {
             conn,
             display,
             damage,
+            damage_region,
             shm,
             cursor_ok,
             pointer: (0, 0),
@@ -194,54 +217,107 @@ impl X11Source {
             | (if on(scroll) { LED_SCROLL_LOCK } else { 0 })
     }
 
-    /// Reads `r` from the X server as packed pixel rows.
-    fn get_image(&self, r: Rect) -> io::Result<Vec<u8>> {
+    /// Bytes per image row of a `w` pixels wide image from the server.
+    fn image_stride(&self, w: u16) -> usize {
         let d = &self.display;
-        let row = usize::from(r.w) * usize::from(d.format.bpp / 8);
-        let stride = (usize::from(r.w) * usize::from(d.format.bpp)).div_ceil(d.scanline_pad)
-            * d.scanline_pad
-            / 8;
-        let (x, y) = (r.x as i16, r.y as i16);
-        let padded;
-        let data: &[u8] = match &self.shm {
+        (usize::from(w) * usize::from(d.format.bpp)).div_ceil(d.scanline_pad) * d.scanline_pad / 8
+    }
+
+    /// Reads the rectangles into `fb`. Every request goes out before the
+    /// first reply is awaited: a round trip can take long while other
+    /// clients keep the X server busy, so one per rectangle is too slow.
+    fn read_rects(&self, rects: &[Rect], fb: &mut Framebuffer) -> io::Result<()> {
+        let d = &self.display;
+        match &self.shm {
             Some((seg, mem)) => {
-                self.conn
-                    .shm_get_image(
-                        d.root,
-                        x,
-                        y,
-                        r.w,
-                        r.h,
-                        !0,
-                        ImageFormat::Z_PIXMAP.into(),
-                        *seg,
-                        0,
-                    )
-                    .map_err(xerr)?
-                    .reply()
-                    .map_err(xerr)?;
-                mem.bytes(stride * usize::from(r.h))
+                // Each image gets its own place in the segment, which holds
+                // the whole screen; a full segment is read before going on.
+                let mut pending = Vec::new();
+                let mut offset = 0;
+                for &r in rects {
+                    let len = self.image_stride(r.w) * usize::from(r.h);
+                    if offset + len > mem.size() {
+                        self.finish_shm(&mut pending, mem, fb)?;
+                        offset = 0;
+                    }
+                    let cookie = self
+                        .conn
+                        .shm_get_image(
+                            d.root,
+                            r.x as i16,
+                            r.y as i16,
+                            r.w,
+                            r.h,
+                            !0,
+                            ImageFormat::Z_PIXMAP.into(),
+                            *seg,
+                            offset as u32,
+                        )
+                        .map_err(xerr)?;
+                    pending.push((r, offset, cookie));
+                    offset += len;
+                }
+                self.finish_shm(&mut pending, mem, fb)
             }
             None => {
-                padded = self
-                    .conn
-                    .get_image(ImageFormat::Z_PIXMAP, d.root, x, y, r.w, r.h, !0)
-                    .map_err(xerr)?
-                    .reply()
-                    .map_err(xerr)?
-                    .data;
-                &padded
+                let cookies = rects
+                    .iter()
+                    .map(|&r| {
+                        let c = self.conn.get_image(
+                            ImageFormat::Z_PIXMAP,
+                            d.root,
+                            r.x as i16,
+                            r.y as i16,
+                            r.w,
+                            r.h,
+                            !0,
+                        );
+                        c.map(|c| (r, c)).map_err(xerr)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                for (r, cookie) in cookies {
+                    let data = cookie.reply().map_err(xerr)?.data;
+                    self.put_image(fb, r, &data)?;
+                }
+                Ok(())
             }
-        };
-        if stride == row {
-            return Ok(data[..row * usize::from(r.h)].to_vec());
         }
-        Ok(data
-            .chunks(stride)
-            .take(r.h.into())
-            .flat_map(|line| &line[..row])
-            .copied()
-            .collect())
+    }
+
+    /// Waits for the pending `ShmGetImage` replies and copies the images.
+    fn finish_shm(
+        &self,
+        pending: &mut Vec<(
+            Rect,
+            usize,
+            x11rb::cookie::Cookie<'_, RustConnection, shm::GetImageReply>,
+        )>,
+        mem: &Segment,
+        fb: &mut Framebuffer,
+    ) -> io::Result<()> {
+        for (r, offset, cookie) in pending.drain(..) {
+            cookie.reply().map_err(xerr)?;
+            let len = self.image_stride(r.w) * usize::from(r.h);
+            self.put_image(fb, r, &mem.bytes(offset + len)[offset..])?;
+        }
+        Ok(())
+    }
+
+    /// Copies an image with the server's row padding into `fb`.
+    fn put_image(&self, fb: &mut Framebuffer, r: Rect, data: &[u8]) -> io::Result<()> {
+        let row = usize::from(r.w) * usize::from(self.display.format.bpp / 8);
+        let stride = self.image_stride(r.w);
+        if stride == row {
+            return fb
+                .put_rect(r, &data[..row * usize::from(r.h)])
+                .map_err(io::Error::other);
+        }
+        for (dy, line) in data.chunks(stride).take(r.h.into()).enumerate() {
+            let line_rect = Rect::new(r.x, r.y + dy as u16, r.w, 1);
+            fb.put_rect(line_rect, &line[..row])
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
     }
 
     /// Follows a screen size change: new size and a matching SHM segment.
@@ -354,16 +430,9 @@ impl FrameSource for X11Source {
             while let Some(event) = self.conn.poll_for_event().map_err(xerr)? {
                 match event {
                     Event::DamageNotify(e) => {
-                        let a = e.area;
-                        changes.damage =
-                            changes
-                                .damage
-                                .union(&Region::from(rfb_region::Rect::from_xywh(
-                                    a.x.into(),
-                                    a.y.into(),
-                                    a.width.into(),
-                                    a.height.into(),
-                                )));
+                        if self.damage_region.is_none() {
+                            changes.damage = changes.damage.union(&region_of(e.area));
+                        }
                         damaged = true;
                     }
                     Event::XfixesCursorNotify(_) => {
@@ -389,10 +458,29 @@ impl FrameSource for X11Source {
                 }
             }
             if damaged {
-                // Clear the damage so the next change is reported again.
-                self.conn
-                    .damage_subtract(self.damage, x11rb::NONE, x11rb::NONE)
-                    .map_err(xerr)?;
+                // Clear the damage so the next change is reported again,
+                // collecting it if it was not in the events.
+                match self.damage_region {
+                    Some(region) => {
+                        self.conn
+                            .damage_subtract(self.damage, x11rb::NONE, region)
+                            .map_err(xerr)?;
+                        let reply = self
+                            .conn
+                            .xfixes_fetch_region(region)
+                            .map_err(xerr)?
+                            .reply()
+                            .map_err(xerr)?;
+                        for a in reply.rectangles {
+                            changes.damage = changes.damage.union(&region_of(a));
+                        }
+                    }
+                    None => {
+                        self.conn
+                            .damage_subtract(self.damage, x11rb::NONE, x11rb::NONE)
+                            .map_err(xerr)?;
+                    }
+                }
             }
             if let Ok(text) = self.clipboard.try_recv() {
                 changes.clipboard = Some(text);
@@ -431,15 +519,11 @@ impl FrameSource for X11Source {
     }
 
     fn read(&mut self, region: &Region, fb: &mut Framebuffer) -> io::Result<()> {
-        // Many small rectangles cost a round trip each; read the bounding
-        // box instead, as TurboVNC does for updates (rfbCombineRect).
+        // Very many small rectangles: read the bounding box instead, as
+        // TurboVNC does for updates (rfbCombineRect).
         let mut region = region.clone();
         region.collapse_if_over(100);
-        for r in region.rects() {
-            let rect = to_wire_rect(r);
-            let pixels = self.get_image(rect)?;
-            fb.put_rect(rect, &pixels).map_err(io::Error::other)?;
-        }
-        Ok(())
+        let rects: Vec<Rect> = region.rects().iter().map(to_wire_rect).collect();
+        self.read_rects(&rects, fb)
     }
 }

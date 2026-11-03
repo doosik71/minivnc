@@ -9,9 +9,10 @@ publish.workspace = true
 
 [dependencies]
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib"] }
-jpeg-encoder = "0.7.1"
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 libc = "0.2.191"
 libz-sys = { version = "1.1.31", features = ["static"] }
+rayon = "1.12.0"
 rfb-proto = { path = "../rfb-proto" }
 turbojpeg = { version = "1.5.1", features = ["cmake"], optional = true }
 zune-core = "0.5.3"
@@ -25,3 +26,10 @@ workspace = true
 
 [features]
 turbojpeg = ["dep:turbojpeg"]
+
+# On Linux, JPEG always uses libjpeg-turbo 3, built from the source in the
+# crate (CMake and NASM), as TurboVNC links it statically; distributions
+# often ship 2.x, which lacks the TurboJPEG 3 API. Elsewhere the
+# `turbojpeg` feature does the same.
+[target.'cfg(target_os = "linux")'.dependencies]
+turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }

@@ -49,9 +49,10 @@ Options take the form -Name=value or -Name value; boolean options alone
 mean 1. Set RUST_LOG (e.g. RUST_LOG=debug) to change the log level.
 
 The maximize button switches to full screen; there, touch the top edge
-for the minimize/restore/close bar.";
+for the minimize/restore/close bar. Ctrl+Alt+Shift+L asks the server for a
+lossless refresh.";
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Options {
     host: String,
     port: u16,
@@ -98,6 +99,20 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The settings of the TurboVNC viewer's lossless refresh (Tight, CL 1,
+    /// no JPEG), or `None` if these settings are lossless already.
+    fn lossless(&self) -> Option<Self> {
+        if self.encoding == ENCODING_TIGHT && self.compress_level == 1 && !self.jpeg {
+            return None;
+        }
+        Some(Self {
+            encoding: ENCODING_TIGHT,
+            compress_level: 1,
+            jpeg: false,
+            ..self.clone()
+        })
+    }
+
     /// The SetEncodings list, in the TurboVNC viewer's order
     /// (`CMsgWriter.writeSetEncodings`) minus what MiniVNC does not
     /// implement (DesktopName, GII, ZRLE, Hextile).
