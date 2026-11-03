@@ -12,7 +12,7 @@ use rfb_proto::consts::*;
 use rfb_proto::msg::ClientMessage;
 use rfb_proto::{PixelFormat, Rect};
 use rfb_region::Region;
-use rfb_server::source::{RGB888, SyntheticSource};
+use rfb_server::source::{Changes, RGB888, SyntheticSource};
 use rfb_server::{Config, FrameSource, InputSink, Server, Sharing};
 
 const W: u16 = 200;
@@ -50,9 +50,9 @@ impl FrameSource for Pattern {
     fn format(&self) -> PixelFormat {
         RGB888
     }
-    fn wait_damage(&mut self, timeout: Duration) -> std::io::Result<Region> {
+    fn wait_changes(&mut self, timeout: Duration) -> std::io::Result<Changes> {
         std::thread::sleep(timeout);
-        Ok(Region::new())
+        Ok(Changes::default())
     }
     fn read(&mut self, _: &Region, fb: &mut Framebuffer) -> std::io::Result<()> {
         for y in 0..H {
@@ -544,4 +544,465 @@ fn incremental_updates_follow_damage() {
         let area: u32 = rects.iter().map(Rect::area).sum();
         assert!(area < all.area() / 2, "{rects:?}");
     }
+}
+
+/// A change injected into [`Scripted`], with its new size if any.
+type Step = (Option<(u16, u16)>, Changes);
+
+/// A grey screen whose changes (and size) the test injects.
+struct Scripted {
+    size: (u16, u16),
+    script: std::sync::mpsc::Receiver<Step>,
+}
+
+fn scripted() -> (Scripted, std::sync::mpsc::Sender<Step>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source = Scripted {
+        size: (W, H),
+        script: rx,
+    };
+    (source, tx)
+}
+
+impl FrameSource for Scripted {
+    fn width(&self) -> u16 {
+        self.size.0
+    }
+    fn height(&self) -> u16 {
+        self.size.1
+    }
+    fn format(&self) -> PixelFormat {
+        RGB888
+    }
+    fn wait_changes(&mut self, timeout: Duration) -> std::io::Result<Changes> {
+        match self.script.recv_timeout(timeout) {
+            Ok((size, changes)) => {
+                if let Some(s) = size {
+                    self.size = s;
+                }
+                Ok(changes)
+            }
+            Err(_) => Ok(Changes::default()),
+        }
+    }
+    fn read(&mut self, region: &Region, fb: &mut Framebuffer) -> std::io::Result<()> {
+        for r in region.rects() {
+            let r = rfb_server::source::to_wire_rect(r);
+            fb.fill_rect(r, pack_rgb(&RGB888, [128, 128, 128])).unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// Reads events until `pick` accepts one, answering fence requests.
+fn wait_event<T>(client: &mut Client<TcpStream>, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
+    loop {
+        let event = client.read_message().unwrap();
+        if let Event::Fence { flags, payload } = &event
+            && flags & FENCE_FLAG_REQUEST != 0
+        {
+            let flags = flags & (FENCE_FLAG_BLOCK_BEFORE | FENCE_FLAG_BLOCK_AFTER);
+            client
+                .send(&ClientMessage::Fence {
+                    flags,
+                    payload: payload.clone(),
+                })
+                .unwrap();
+        }
+        if let Some(v) = pick(&event) {
+            return v;
+        }
+    }
+}
+
+#[test]
+fn fences_and_continuous_updates() {
+    let (source, script) = scripted();
+    let addr = start_with(source, no_auth(Config::default()), None);
+    let mut client = connect(addr, None).unwrap();
+    let all = Rect::new(0, 0, W, H);
+    client
+        .set_encodings(&[ENCODING_RAW, ENCODING_FENCE, ENCODING_CONTINUOUS_UPDATES])
+        .unwrap();
+    // The initial fence request, then EndOfContinuousUpdates to show that
+    // continuous updates are supported.
+    let payload = wait_event(&mut client, |e| match e {
+        Event::Fence { flags, payload } if flags & FENCE_FLAG_REQUEST != 0 => Some(payload.clone()),
+        _ => None,
+    });
+    assert_eq!(payload, [0]);
+    wait_event(&mut client, |e| {
+        (*e == Event::EndOfContinuousUpdates).then_some(())
+    });
+
+    // Without any update request, changes keep coming.
+    client
+        .send(&ClientMessage::EnableContinuousUpdates {
+            enable: true,
+            rect: all,
+        })
+        .unwrap();
+    for i in 0..3u16 {
+        let damage = Region::from(rfb_region::Rect::from_xywh(i32::from(i) * 10, 0, 5, 5));
+        script.send((None, Changes::from(damage))).unwrap();
+        let rects = wait_event(&mut client, |e| match e {
+            Event::FramebufferUpdate(r) if !r.is_empty() => Some(r.clone()),
+            _ => None,
+        });
+        assert_eq!(rects, [Rect::new(i * 10, 0, 5, 5)]);
+    }
+    client
+        .send(&ClientMessage::EnableContinuousUpdates {
+            enable: false,
+            rect: all,
+        })
+        .unwrap();
+    wait_event(&mut client, |e| {
+        (*e == Event::EndOfContinuousUpdates).then_some(())
+    });
+}
+
+#[test]
+fn cursor_shape_and_position() {
+    let (source, script) = scripted();
+    let addr = start_with(source, no_auth(Config::default()), None);
+    let mut client = connect(addr, None).unwrap();
+    client.set_pixel_format(RGB888).unwrap();
+    client
+        .set_encodings(&[ENCODING_RAW, ENCODING_RICH_CURSOR, ENCODING_POINTER_POS])
+        .unwrap();
+    let cursor = rfb_server::Cursor {
+        width: 2,
+        height: 1,
+        hot_x: 1,
+        hot_y: 0,
+        // Opaque red, transparent.
+        pixels: vec![0xffff_0000, 0],
+    };
+    script
+        .send((
+            None,
+            Changes {
+                cursor: Some(cursor),
+                pointer: Some((50, 60)),
+                ..Changes::default()
+            },
+        ))
+        .unwrap();
+    // A hidden cursor and position (0, 0) may come first, if the server
+    // had none yet when the client asked for them; then ask again.
+    let (mut shape, mut pos) = (None, None);
+    while shape.is_none() || pos != Some((50, 60)) {
+        client.request_update(true, Rect::new(0, 0, W, H)).unwrap();
+        loop {
+            match client.read_message().unwrap() {
+                Event::Cursor(c) if c.width > 0 => shape = Some(c),
+                Event::PointerPos { x, y } => pos = Some((x, y)),
+                Event::FramebufferUpdate(_) => break,
+                _ => {}
+            }
+        }
+    }
+    let shape = shape.unwrap();
+    assert_eq!(
+        (shape.width, shape.height, shape.hot_x, shape.hot_y),
+        (2, 1, 1, 0)
+    );
+    assert_eq!(shape.rgba, [255, 0, 0, 255, 0, 0, 0, 0]);
+}
+
+/// Resizes the scripted source when asked.
+struct Resizer {
+    script: std::sync::mpsc::Sender<Step>,
+    size: (u16, u16),
+}
+
+impl InputSink for Resizer {
+    fn key(&mut self, _: bool, _: u32) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn pointer(&mut self, _: u16, _: u16, _: u16) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn release_all_keys(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    /// Like the X11 sink: limited to 1000x1000.
+    fn set_desktop_size(&mut self, width: u16, height: u16) -> Result<(u16, u16), u16> {
+        let size = (width.min(1000), height.min(1000));
+        if size != self.size {
+            self.size = size;
+            let changes = Changes {
+                resized: true,
+                ..Changes::default()
+            };
+            self.script.send((Some(size), changes)).unwrap();
+        }
+        Ok(size)
+    }
+}
+
+#[test]
+fn desktop_resize() {
+    let (source, script) = scripted();
+    let input = Box::new(Resizer {
+        script,
+        size: (W, H),
+    });
+    let addr = start_with(source, no_auth(Config::default()), Some(input));
+    let mut client = connect(addr, None).unwrap();
+    client
+        .set_encodings(&[ENCODING_RAW, ENCODING_EXTENDED_DESKTOP_SIZE])
+        .unwrap();
+    // A full update request is answered with the current layout first.
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    let eds = |e: &Event| match e {
+        Event::ExtendedDesktopSize {
+            reason,
+            result,
+            width,
+            height,
+            screens,
+        } => Some((*reason, *result, *width, *height, screens.len())),
+        _ => None,
+    };
+    assert_eq!(
+        wait_event(&mut client, eds),
+        (EDS_REASON_SERVER, 0, W, H, 1)
+    );
+
+    let set_size = |client: &mut Client<TcpStream>, width, height| {
+        let screens = vec![rfb_proto::msg::Screen {
+            id: 0,
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+            flags: 0,
+        }];
+        client
+            .send(&ClientMessage::SetDesktopSize {
+                width,
+                height,
+                screens,
+            })
+            .unwrap();
+    };
+    // Too large for the source: it grows as far as it can.
+    set_size(&mut client, 2000, 100);
+    assert_eq!(
+        wait_event(&mut client, eds),
+        (EDS_REASON_CLIENT, EDS_RESULT_SUCCESS, 1000, 100, 1)
+    );
+    // Already as large as allowed: answered at once, nothing changes.
+    set_size(&mut client, 3000, 100);
+    assert_eq!(
+        wait_event(&mut client, eds),
+        (EDS_REASON_CLIENT, EDS_RESULT_SUCCESS, 1000, 100, 1)
+    );
+    // Accepted: the framebuffer follows.
+    set_size(&mut client, 320, 240);
+    assert_eq!(
+        wait_event(&mut client, eds),
+        (EDS_REASON_CLIENT, EDS_RESULT_SUCCESS, 320, 240, 1)
+    );
+    assert_eq!(client.framebuffer().width(), 320);
+    client
+        .request_update(true, Rect::new(0, 0, 320, 240))
+        .unwrap();
+    let rects = wait_event(&mut client, |e| match e {
+        Event::FramebufferUpdate(r) if !r.is_empty() => Some(r.clone()),
+        _ => None,
+    });
+    assert_eq!(rects, [Rect::new(0, 0, 320, 240)]);
+}
+
+/// Takes QEMU key codes and records them.
+#[derive(Clone, Default)]
+struct QemuRecorder(Recorder);
+
+impl InputSink for QemuRecorder {
+    fn key(&mut self, down: bool, keysym: u32) -> std::io::Result<()> {
+        self.0.key(down, keysym)
+    }
+    fn qemu_keys(&self) -> bool {
+        true
+    }
+    fn qemu_key(&mut self, down: bool, keysym: u32, keycode: u32) -> std::io::Result<()> {
+        let event = format!("qemu {keycode:#x} {keysym:#x} {down}");
+        self.0.0.lock().unwrap().push(event);
+        Ok(())
+    }
+    fn pointer(&mut self, x: u16, y: u16, buttons: u16) -> std::io::Result<()> {
+        self.0.pointer(x, y, buttons)
+    }
+    fn release_all_keys(&mut self) -> std::io::Result<()> {
+        self.0.release_all_keys()
+    }
+    fn set_clipboard(&mut self, text: &str) -> std::io::Result<()> {
+        self.0.0.lock().unwrap().push(format!("clipboard {text:?}"));
+        Ok(())
+    }
+}
+
+#[test]
+fn qemu_keys_leds_and_mouse_buttons() {
+    let (source, script) = scripted();
+    let rec = QemuRecorder::default();
+    let input = Box::new(rec.clone());
+    let addr = start_with(source, no_auth(Config::default()), Some(input));
+    rec.0.wait_for(1); // release all keys
+    let mut client = connect(addr, None).unwrap();
+    script
+        .send((
+            None,
+            Changes {
+                leds: Some(LED_CAPS_LOCK),
+                ..Changes::default()
+            },
+        ))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    client
+        .set_encodings(&[
+            ENCODING_RAW,
+            ENCODING_QEMU_EXTENDED_KEY_EVENT,
+            ENCODING_QEMU_LED_STATE,
+            ENCODING_EXTENDED_MOUSE_BUTTONS,
+        ])
+        .unwrap();
+    client.request_update(true, Rect::new(0, 0, W, H)).unwrap();
+    let mut seen = Vec::new();
+    while seen.len() < 3 {
+        let e = client.read_message().unwrap();
+        if matches!(
+            e,
+            Event::QemuKeyEvents | Event::LedState(_) | Event::ExtendedMouseButtons
+        ) {
+            seen.push(e);
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            Event::QemuKeyEvents,
+            Event::LedState(LED_CAPS_LOCK),
+            Event::ExtendedMouseButtons
+        ]
+    );
+    // Hangul key: XT 0x72 with the Hangul keysym.
+    client
+        .send(&ClientMessage::QemuKeyEvent {
+            down: true,
+            keysym: 0xff31,
+            keycode: 0x72,
+        })
+        .unwrap();
+    // Button 8 needs the extended pointer event.
+    pointer(&mut client, 1, 2, 1 << 7);
+    assert_eq!(
+        rec.0.wait_for(3)[1..],
+        ["qemu 0x72 0xff31 true", "pointer 1,2 128"]
+    );
+}
+
+#[test]
+fn clipboard_both_ways_and_bell() {
+    let (source, script) = scripted();
+    let rec = QemuRecorder::default();
+    let addr = start_with(
+        source,
+        no_auth(Config::default()),
+        Some(Box::new(rec.clone())),
+    );
+    rec.0.wait_for(1);
+
+    // A legacy client gets Latin-1 text and sends Latin-1 text.
+    let mut legacy = connect(addr, None).unwrap();
+    legacy.set_encodings(&[ENCODING_RAW]).unwrap();
+    // An extended client accepts unsolicited transfers up to 1 MiB.
+    let mut ext = connect(addr, None).unwrap();
+    ext.set_encodings(&[ENCODING_RAW, ENCODING_EXTENDED_CLIPBOARD])
+        .unwrap();
+    let caps = wait_event(&mut ext, |e| match e {
+        Event::ServerCutText(rfb_proto::msg::CutText::Extended { flags, .. }) => Some(*flags),
+        _ => None,
+    });
+    assert_ne!(caps & EXT_CLIP_CAPS, 0);
+    let flags = EXT_CLIP_UTF8 | EXT_CLIP_REQUEST | EXT_CLIP_NOTIFY | EXT_CLIP_PROVIDE;
+    let mut sizes = [0; 16];
+    sizes[0] = 1 << 20;
+    ext.send(&ClientMessage::ClientCutText(
+        rfb_proto::msg::CutText::Extended {
+            flags: flags | EXT_CLIP_CAPS,
+            data: rfb_codec::clipboard::encode_caps(flags, &sizes),
+        },
+    ))
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let text = "héllo 한글\nworld";
+    script
+        .send((
+            None,
+            Changes {
+                clipboard: Some(text.into()),
+                bell: true,
+                ..Changes::default()
+            },
+        ))
+        .unwrap();
+    let (mut latin1, mut bell) = (None, false);
+    while latin1.is_none() || !bell {
+        match legacy.read_message().unwrap() {
+            Event::ServerCutText(rfb_proto::msg::CutText::Latin1(t)) => latin1 = Some(t),
+            Event::Bell => bell = true,
+            _ => {}
+        }
+    }
+    assert_eq!(latin1.unwrap(), b"h\xe9llo ??\nworld");
+    let provided = wait_event(&mut ext, |e| match e {
+        Event::ServerCutText(rfb_proto::msg::CutText::Extended { flags, data })
+            if flags & EXT_CLIP_PROVIDE != 0 =>
+        {
+            rfb_codec::clipboard::decode_provide(*flags, data, 1 << 20)
+        }
+        _ => None,
+    });
+    assert_eq!(provided, text);
+
+    // Client to desktop: legacy text, then an extended notify that the
+    // server answers with a request.
+    legacy
+        .send(&ClientMessage::ClientCutText(
+            rfb_proto::msg::CutText::Latin1(b"caf\xe9".to_vec()),
+        ))
+        .unwrap();
+    ext.send(&ClientMessage::ClientCutText(
+        rfb_proto::msg::CutText::Extended {
+            flags: EXT_CLIP_NOTIFY | EXT_CLIP_UTF8,
+            data: Vec::new(),
+        },
+    ))
+    .unwrap();
+    let request = wait_event(&mut ext, |e| match e {
+        Event::ServerCutText(rfb_proto::msg::CutText::Extended { flags, .. })
+            if flags & EXT_CLIP_REQUEST != 0 =>
+        {
+            Some(*flags)
+        }
+        _ => None,
+    });
+    assert_eq!(request, EXT_CLIP_REQUEST | EXT_CLIP_UTF8);
+    ext.send(&ClientMessage::ClientCutText(
+        rfb_proto::msg::CutText::Extended {
+            flags: EXT_CLIP_PROVIDE | EXT_CLIP_UTF8,
+            data: rfb_codec::clipboard::encode_provide("line1\r\nline2", 6),
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        rec.0.wait_for(3)[1..],
+        ["clipboard \"café\"", "clipboard \"line1\\nline2\""]
+    );
 }

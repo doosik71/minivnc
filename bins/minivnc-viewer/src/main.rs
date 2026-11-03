@@ -5,7 +5,9 @@
 //! main thread.
 
 mod conn;
+mod connbar;
 mod keys;
+mod platform;
 mod ucs_table;
 mod window;
 
@@ -32,9 +34,14 @@ usage: minivnc-viewer [options] HOST[:DISPLAY | ::PORT]
   -CompressLevel=N      compression level 0-9 (default 1)
   -Shared=0|1           let other viewers stay connected (default 1)
   -ViewOnly             do not send keyboard and mouse input
+  -DesktopSize=MODE     Auto (default): resize the remote desktop to fit the
+                        window; Server: keep the server's size
 
 Options take the form -Name=value or -Name value; boolean options alone
-mean 1. Set RUST_LOG (e.g. RUST_LOG=debug) to change the log level.";
+mean 1. Set RUST_LOG (e.g. RUST_LOG=debug) to change the log level.
+
+The maximize button switches to full screen; there, touch the top edge
+for the minimize/restore/close bar.";
 
 #[derive(Debug)]
 struct Options {
@@ -51,6 +58,8 @@ struct Options {
     compress_level: i32,
     shared: bool,
     view_only: bool,
+    /// `-DesktopSize=Auto`
+    auto_resize: bool,
 }
 
 impl Default for Options {
@@ -68,17 +77,30 @@ impl Default for Options {
             compress_level: 1,
             shared: true,
             view_only: false,
+            auto_resize: true,
         }
     }
 }
 
 impl Options {
     /// The SetEncodings list, in the TurboVNC viewer's order
-    /// (`CMsgWriter.writeSetEncodings`) minus what MiniVNC cannot decode.
+    /// (`CMsgWriter.writeSetEncodings`) minus what MiniVNC does not
+    /// implement (DesktopName, GII, ZRLE, Hextile).
     fn encodings(&self) -> Vec<i32> {
         let mut list = vec![
+            ENCODING_RICH_CURSOR,
+            ENCODING_X_CURSOR,
+            ENCODING_NEW_FB_SIZE,
+            ENCODING_EXTENDED_DESKTOP_SIZE,
             ENCODING_LAST_RECT,
+            ENCODING_CONTINUOUS_UPDATES,
+            ENCODING_FENCE,
+            ENCODING_EXTENDED_CLIPBOARD,
+            ENCODING_QEMU_EXTENDED_KEY_EVENT,
+            ENCODING_QEMU_LED_STATE,
+            ENCODING_VMWARE_LED_STATE,
             ENCODING_TIGHT_WITHOUT_ZLIB,
+            ENCODING_EXTENDED_MOUSE_BUTTONS,
             self.encoding,
             ENCODING_COPY_RECT,
         ];
@@ -88,6 +110,7 @@ impl Options {
         if self.encoding != ENCODING_RAW {
             list.push(ENCODING_RAW);
         }
+        list.push(ENCODING_LAST_RECT);
         list.push(ENCODING_COMPRESS_LEVEL0 + self.compress_level);
         if self.jpeg && self.encoding == ENCODING_TIGHT {
             list.extend([
@@ -189,6 +212,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
             "compresslevel" => opts.compress_level = parse_int(&value, name, 0..=9)?,
             "shared" => opts.shared = flag()?,
             "viewonly" => opts.view_only = flag()?,
+            "desktopsize" => {
+                opts.auto_resize = match value.to_ascii_lowercase().as_str() {
+                    "auto" => true,
+                    "server" => false,
+                    _ => return Err(format!("bad {name} value {value} (Auto, Server)")),
+                }
+            }
             "h" | "help" | "?" => return Err(String::new()),
             _ => return Err(format!("unknown option {name}")),
         }
@@ -228,7 +258,7 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
         client.framebuffer().width(),
         client.framebuffer().height()
     );
-    window::run(client, writer, opts.encodings(), opts.view_only)
+    window::run(client, writer, opts)
 }
 
 fn main() -> ExitCode {
@@ -291,8 +321,9 @@ mod tests {
         .unwrap();
         assert_eq!((o.quality, o.compress_level), (80, 6));
         assert_eq!(o.subsampling, 2);
-        assert!(o.view_only && !o.shared);
+        assert!(o.view_only && !o.shared && o.auto_resize);
         assert_eq!((o.host.as_str(), o.port), ("myhost", 5903));
+        assert!(!parse(&["-DesktopSize=Server", "h"]).unwrap().auto_resize);
         assert!(parse(&["-Quality=0", "h"]).is_err());
         assert!(parse(&["-Encoding=ZRLE", "h"]).is_err());
         assert!(parse(&["-Bogus", "h"]).is_err());
@@ -304,11 +335,23 @@ mod tests {
         assert_eq!(
             Options::default().encodings(),
             [
+                ENCODING_RICH_CURSOR,
+                ENCODING_X_CURSOR,
+                ENCODING_NEW_FB_SIZE,
+                ENCODING_EXTENDED_DESKTOP_SIZE,
                 ENCODING_LAST_RECT,
+                ENCODING_CONTINUOUS_UPDATES,
+                ENCODING_FENCE,
+                ENCODING_EXTENDED_CLIPBOARD,
+                ENCODING_QEMU_EXTENDED_KEY_EVENT,
+                ENCODING_QEMU_LED_STATE,
+                ENCODING_VMWARE_LED_STATE,
                 ENCODING_TIGHT_WITHOUT_ZLIB,
+                ENCODING_EXTENDED_MOUSE_BUTTONS,
                 ENCODING_TIGHT,
                 ENCODING_COPY_RECT,
                 ENCODING_RAW,
+                ENCODING_LAST_RECT,
                 ENCODING_COMPRESS_LEVEL0 + 1,
                 ENCODING_QUALITY_LEVEL0 + 9,
                 ENCODING_FINE_QUALITY_LEVEL0 + 95,

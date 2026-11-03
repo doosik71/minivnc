@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use rfb_codec::{Framebuffer, pack_rgb, write_pixel};
 use rfb_region::{Rect, Region};
 
-use super::{FrameSource, RGB888, to_wire_rect};
+use super::{Changes, FrameSource, RGB888, to_wire_rect};
 
 const SQUARE: i32 = 64;
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -101,20 +101,20 @@ impl FrameSource for SyntheticSource {
         RGB888
     }
 
-    fn wait_damage(&mut self, timeout: Duration) -> io::Result<Region> {
+    fn wait_changes(&mut self, timeout: Duration) -> io::Result<Changes> {
         let now = Instant::now();
         if self.next_frame > now {
             let wait = self.next_frame - now;
             if wait > timeout {
                 thread::sleep(timeout);
-                return Ok(Region::new());
+                return Ok(Changes::default());
             }
             thread::sleep(wait);
         }
         self.next_frame += FRAME_INTERVAL;
         let before = Region::from(self.square());
         self.step();
-        Ok(before.union(&Region::from(self.square())))
+        Ok(before.union(&Region::from(self.square())).into())
     }
 
     fn read(&mut self, region: &Region, fb: &mut Framebuffer) -> io::Result<()> {
@@ -141,7 +141,7 @@ mod tests {
     fn damage_covers_old_and_new_square() {
         let mut src = SyntheticSource::new(200, 100);
         src.next_frame = Instant::now();
-        let damage = src.wait_damage(Duration::from_secs(1)).unwrap();
+        let damage = src.wait_changes(Duration::from_secs(1)).unwrap().damage;
         assert_eq!(damage.extents(), Some(Rect::new(0, 0, 72, 70)));
     }
 

@@ -4,6 +4,7 @@ use std::{fmt, io};
 
 use rfb_proto::Rect;
 
+pub mod clipboard;
 pub mod copyrect;
 mod framebuffer;
 pub mod jpeg;

@@ -581,6 +581,24 @@ impl Keyboard {
         Ok(())
     }
 
+    /// A key given by its X keycode (QEMU Extended Key Event, TurboVNC
+    /// `ExtKeyEvent`). The pressed-key map is kept up to date in case
+    /// events with and without keycodes are mixed.
+    pub fn raw_key(
+        &mut self,
+        dev: &mut impl KeyboardDevice,
+        keycode: u8,
+        keysym: u32,
+        down: bool,
+    ) -> io::Result<()> {
+        if down && keysym != 0 {
+            self.pressed.insert(keycode, keysym);
+        } else {
+            self.pressed.remove(&keycode);
+        }
+        dev.fake_key(keycode, down)
+    }
+
     /// Releases every key the X server reports as down
     /// (`KbdReleaseAllKeys`).
     pub fn release_all(&mut self, dev: &mut impl KeyboardDevice) -> io::Result<()> {

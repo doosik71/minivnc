@@ -627,23 +627,46 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - 사람이 실제 키보드·마우스로 쓰는 감각(한글 IME, Shift 조합, 반응성)은 사용자가 직접 확인한다.
 
 ### M5. 고급 프로토콜 기능 (3주)
-- [ ] **Fence + Continuous Updates + 흐름 제어**
-  - `flowcontrol.c`의 Vegas 방식 혼잡 제어를 수치까지 그대로 이식한다.
-  - 뷰어 쪽: SyncNext fence → CU 활성화, fence payload를 이용한 픽셀 포맷 동기 전환
-- [ ] **ExtendedDesktopSize / SetDesktopSize**
-  - 서버: RandR로 크기 변경, `no-remote-resize`, 첫 FBU에 항상 포함
-  - 뷰어: `DesktopSize=Auto`일 때 창 크기에 맞춰 원격 크기를 바꾼다.
-- [ ] **QEMU Extended Key Event + LED 상태**
-  - 서버: `qnum_to_xorgevdev`/`qnum_to_xorgkbd` 테이블(QEMU keymap-gen 데이터에서 생성), XKB 룰(evdev/base) 감지
-  - 뷰어: Windows 스캔코드(확장 키 0x80 처리, RShift 보정), X11 keycode → qnum
-  - **한/영 키 → 0x72 + `XK_Hangul`, 한자 키 → 0x71 + `XK_Hangul_Hanja`를 기본 내장한다.**
-    - Windows: `VK_HANGUL`/`VK_HANJA`를 raw input으로 감지한다.
-    - keysym 경로로 폴백할 때도 keysym을 보낸다(원본 패치는 QEMU 경로가 없으면 키를 버린다).
-  - AltGr 보정, LED 동기화
-- [ ] **커서 모양:** RichCursor/XCursor/PointerPos 송신(서버)과 로컬 커서 적용(뷰어)
-- [ ] **Extended Clipboard**(UTF-8, zlib) 양방향, 레거시 cut text 폴백, `MaxClipboard`
-- [ ] ExtendedMouseButtons, Bell
+- [x] **Fence + Continuous Updates + 흐름 제어**
+  - `flowcontrol.c`의 Vegas 방식 혼잡 제어를 수치까지 그대로 이식했다(`rfb-server/src/flow.rs`). 업데이트 앞뒤로 RTT ping fence를 보내고, 혼잡하면 예상 시간 뒤에 다시 시도한다(`-noflowcontrol`로 끔).
+    - 원본과 다른 점이 하나 있다. 지연 급증으로 창이 4096 아래로 줄어든 직후 Vegas 단계에서 4096을 빼면 원본의 `unsigned`가 최대 창으로 넘어간다. 여기서는 0에서 멈춘 뒤 최소 창으로 맞춘다.
+  - SyncNext fence는 다음 메시지를 처리한 뒤 응답하고, 그동안 업데이트를 보내지 않는다(TurboVNC `syncFence`).
+  - 뷰어 쪽: 서버 fence 요청에 바로 응답하고, EndOfContinuousUpdates를 받았으면 첫 업데이트 뒤 CU를 켠다(Java `CConn`). CU 중에는 업데이트 요청을 보내지 않는다. 뷰어는 픽셀 포맷을 바꾸지 않으므로 fence payload를 이용한 픽셀 포맷 동기 전환은 하지 않았다.
+- [x] **ExtendedDesktopSize / SetDesktopSize**
+  - 서버: non-incremental 요청 때와 크기가 바뀔 때 ExtendedDesktopSize(와 DesktopSize)를 보낸다. 요청한 클라이언트에는 reason=client, 다른 클라이언트에는 other-client로 알린다. `-noremoteresize`로 끈다.
+  - X11: RandR로 WxH 모드를 만들어 출력에 붙이고 CRTC를 바꾼다. 화면을 두 크기 중 큰 쪽으로 넓힌 상태에서 바꾸므로 실패해도 출력이 꺼지지 않는다. Xvfb는 모드를 바꿀 수 없어 화면 크기만 바꾸며(시작 크기 이하), 크기는 루트 창 ConfigureNotify로 감지한다.
+  - X 서버가 허용하는 최대 크기를 넘는 요청은 TurboVNC처럼 거절하지 않고 최대 크기까지만 키운다(사용자 결정). 이미 그 크기면 바로 성공으로 답한다. `InputSink::set_desktop_size`는 실제로 적용한 크기를 돌려준다.
+  - 화면은 하나(id 0)로만 다룬다. 다중 화면 배치 요청은 검증만 하고 전체 크기만 반영한다.
+  - 뷰어: `-DesktopSize=Auto`(기본)이면 창 크기가 0.5초 동안 그대로일 때 SetDesktopSize를 보낸다. 서버가 요청보다 작게 맞추면 창은 그대로 두고 남는 부분을 여백으로 그린다. `Server`면 창이 원격 크기를 넘지 않는다. 서버가 스스로 크기를 바꾸면 창을 따라 바꾼다.
+  - 뷰어 전체 화면(사용자 요청): 최대화 버튼을 누르면 창이 있는 모니터를 테두리 없이 채운다. 원격에서 F11을 써야 하므로 F11 단축키는 두지 않는다. 전체 화면에서는 마우스가 위쪽 가장자리 가운데(버튼 양옆에 230픽셀씩 여백을 둔 약 600픽셀 범위)에 닿으면 뷰어가 직접 그린 연결 바(최소화·복원·닫기)가 나타나고, 바를 벗어나면 사라진다.
+- [x] **QEMU Extended Key Event + LED 상태**
+  - 서버: `qnum_to_xorgevdev`/`qnum_to_xorgkbd` 표를 TurboVNC 소스(QEMU keymap-gen 생성물)에서 생성했다(`capture-x11/src/qnum_table.rs`). XKB 규칙은 루트의 `_XKB_RULES_NAMES`로 감지하며, evdev 또는 base/xorg가 아니면 확장을 제안하지 않는다. 표에 없는 코드는 keysym 경로로 처리한다(`ExtKeyEvent`).
+  - LED: XKB 지시등 "Caps Lock"/"Num Lock"/"Scroll Lock"의 IndicatorStateNotify를 받아 QEMU(1바이트) 또는 VMware(4바이트) LED 의사 사각형으로 보낸다.
+  - 뷰어: OS 스캔코드 대신 winit의 물리 키(`KeyCode`) → qnum 표를 써서 Windows와 Linux가 같은 코드를 쓴다(E0 확장 키는 0x80).
+  - **한/영 키 → 0x72 + `XK_Hangul`, 한자 키 → 0x71 + `XK_Hangul_Hanja`를 기본 내장했다.**
+    - Windows 한국어 배열에서 winit이 주는 논리 키 `HangulMode`/`HanjaMode`로 감지하므로 raw input은 필요 없다. 물리 위치(오른쪽 Alt/Ctrl)와 상관없이 위 코드를 보낸다.
+    - 서버가 QEMU 확장을 지원하지 않으면 keysym(`Hangul`/`Hangul_Hanja`)만 보낸다.
+  - AltGr: QEMU 경로에서는 오른쪽 Alt의 키코드가 그대로 가서 서버 키맵이 Level3를 처리한다. keysym 경로의 Windows AltGr(가짜 LCtrl) 보정은 하지 않았다.
+  - LED 동기화(사용자 결정): 서버 LED 상태를 받거나 창이 포커스를 얻을 때, 로컬 락 상태와 다른 락 키만 서버에 눌러 맞춘다. 로컬 키보드는 건드리지 않는다. 로컬 락 상태는 Windows에서만 읽는다(winit이 알려 주지 않음).
+- [x] **커서 모양**
+  - 서버: XFixes ARGB 커서를 RichCursor(채널 상위 비트, 알파 > 127이 마스크) 또는 XCursor로 보낸다. ARGB 커서에는 두 색이 없으므로 XCursor는 어두운 픽셀을 검정 전경, 나머지를 흰 배경으로 만든다.
+  - 다른 클라이언트의 포인터 이동은 PointerPos로 알린다(자기 이동은 알리지 않음).
+  - 커서 모양을 받지 않는 클라이언트를 위해 서버가 커서를 그린 프레임버퍼를 따로 유지한다(커서 합성을 캡처에서 `rfb-server`로 옮김). TurboVNC처럼 화면 하나에 커서를 넣고 빼는 대신 버퍼를 둘 둔다.
+  - 뷰어: 받은 모양을 winit 사용자 커서로 쓰고, 빈 커서면 로컬 커서를 숨긴다. 모양을 받기 전에는 점 커서를 쓴다.
+- [x] **Extended Clipboard**(UTF-8, zlib) 양방향, 레거시 cut text 폴백, `-maxclipboard`, `-noclipboardsend`/`-noclipboardrecv`, `-noprimarysync`
+  - 서버(X11): 클립보드 전용 연결·스레드가 XFixes로 CLIPBOARD(와 PRIMARY) 소유자 변경을 감시해 UTF8_STRING(없으면 STRING)으로 가져온다. 클라이언트 텍스트는 선택을 소유해 TARGETS/UTF8_STRING/TEXT/STRING 요청에 답한다. INCR 전송은 지원하지 않는다.
+  - 클라이언트가 Notify를 보내면 TurboVNC는 X 앱이 요청할 때 가져오지만, MiniVNC는 바로 Request를 보낸다.
+  - 뷰어: 서버 Caps에 크기 1 MiB로 답해 서버가 바로 보내게 하고, 창이 포커스를 얻을 때 로컬 클립보드가 바뀌었으면 Notify(확장) 또는 ClientCutText(레거시)로 알린다(`arboard`).
+- [x] ExtendedMouseButtons(뷰어: 뒤로/앞으로 = 버튼 8/9, 서버: 15개까지 XTest로 전달), Bell(서버: XKB BellNotify, 뷰어: Windows `MessageBeep`)
 - **DoD:** TurboVNC 뷰어 ↔ MiniVNC 서버, Xvnc ↔ MiniVNC 뷰어 양방향에서 CU/Fence가 활성화되고, 한/영·한자 키가 서버 `xev`에서 keycode 130/131로 나온다.
+- **검증 기록 (2026-11-03)**
+  - 환경: Windows 11 ↔ WSL Ubuntu 26.04(TurboVNC 3.3.1 Xvnc, MiniVNC 서버 + Xvfb 1280x800 + xfce4, XKB 규칙 evdev/kr). MiniVNC 뷰어 입력은 뷰어 창에만 창 메시지를 보내 시험했다.
+  - **CU/Fence**: TurboVNC Java 뷰어 → MiniVNC 서버에서 CU, QEMU 키, LED 상태, 확장 마우스 버튼이 켜졌다(뷰어 로그). MiniVNC 뷰어 → Xvnc와 → MiniVNC 서버에서도 CU와 QEMU 키 코드가 켜졌다.
+  - **한/영·한자**: MiniVNC 뷰어에서 `VK_HANGUL`/`VK_HANJA`를 보내자 Xvnc와 MiniVNC 서버 양쪽의 `xev`에 keycode 130 `Hangul`, 131 `Hangul_Hanja`가 나왔다.
+  - **원격 크기**: MiniVNC 뷰어 창을 줄이자 Xvfb 화면이 884x561로 바뀌었고, xfce가 새 크기에 맞춰 다시 배치됐다.
+  - **클립보드**: Java 뷰어의 클립보드(Notify → Request → Provide)가 X CLIPBOARD로 들어가 터미널 붙여넣기로 확인됐다. 서버 → 클라이언트 방향과 레거시/확장 형식은 루프백 테스트로 확인했다. MiniVNC 뷰어의 로컬 클립보드 연동은 사용자 PC 클립보드를 바꾸므로 자동 시험하지 않았다.
+  - **회귀**: 무손실 Xvnc 화면은 원본과 0픽셀 차이였고, mpv 30fps 영상의 업데이트 속도는 23.4/s로 M3와 같았다.
+  - 루프백 테스트를 추가했다: fence와 CU, 커서 모양과 위치, 데스크톱 크기 변경(성공/거부), QEMU 키·LED·확장 마우스 버튼, 클립보드 양방향과 벨.
 
 ### M6. 보안 (2주)
 - [ ] **Tight 보안 타입**(16): 터널/인증 능력, 상호작용 능력(서버 송신, 클라이언트 수신 후 무시)

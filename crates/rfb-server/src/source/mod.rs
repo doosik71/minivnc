@@ -23,15 +23,60 @@ pub const RGB888: PixelFormat = PixelFormat {
     shift: [16, 8, 0],
 };
 
+/// A cursor image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// Premultiplied ARGB, row by row; empty when the cursor is hidden.
+    pub pixels: Vec<u32>,
+}
+
+/// What changed since the previous [`FrameSource::wait_changes`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// Screen area that changed.
+    pub damage: Region,
+    /// The screen size changed: the whole screen must be read again at the
+    /// new [`FrameSource::width`] and [`FrameSource::height`].
+    pub resized: bool,
+    /// The cursor image, if it changed.
+    pub cursor: Option<Cursor>,
+    /// The pointer position, if it moved.
+    pub pointer: Option<(u16, u16)>,
+    /// The lock key state (`LED_*` bits), if it changed.
+    pub leds: Option<u32>,
+    /// The bell rang.
+    pub bell: bool,
+    /// New clipboard text on the desktop.
+    pub clipboard: Option<String>,
+}
+
+impl From<Region> for Changes {
+    fn from(damage: Region) -> Self {
+        Self {
+            damage,
+            ..Self::default()
+        }
+    }
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Provides the screen. Runs on a dedicated thread, so calls may block.
 pub trait FrameSource: Send + 'static {
     fn width(&self) -> u16;
     fn height(&self) -> u16;
     fn format(&self) -> PixelFormat;
 
-    /// Waits up to `timeout` for the screen to change and returns the changed
-    /// area (empty on timeout).
-    fn wait_damage(&mut self, timeout: Duration) -> io::Result<Region>;
+    /// Waits up to `timeout` for something to change (empty on timeout).
+    fn wait_changes(&mut self, timeout: Duration) -> io::Result<Changes>;
 
     /// Copies `region` of the current screen into `fb`, which has this
     /// source's size and format.

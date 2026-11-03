@@ -7,7 +7,7 @@ TurboVNC의 강점을 Rust로 옮겨, 메모리 안전하고 배포하기 쉬운
 - 지연 업데이트와 혼잡 제어
 - 자동 무손실 갱신(ALR)
 
-> **상태:** M4(뷰어 MVP)를 마쳤습니다. 서버는 Linux에서 기존 X 디스플레이(Xvfb, Xorg)를 TurboVNC 방식의 Tight(JPEG 포함) 또는 Raw로 공유하고, 키보드·마우스 입력을 XTest로 주입합니다. 뷰어(`minivnc-viewer`)는 TurboVNC 스타일 옵션으로 TurboVNC 서버(Xvnc)와 MiniVNC 서버에 접속해 화면 표시, 키보드, 마우스·휠, 스크롤을 지원합니다. 커서 모양, 화면 크기 변경, 클립보드, 한/영·한자 키의 QEMU 경로는 M5에서 합니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
+> **상태:** M5(고급 프로토콜 기능)를 마쳤습니다. 서버는 Linux에서 기존 X 디스플레이(Xvfb, Xorg)를 TurboVNC 방식의 Tight(JPEG 포함) 또는 Raw로 공유하고, 뷰어(`minivnc-viewer`)는 TurboVNC 서버(Xvnc)와 MiniVNC 서버에 접속합니다. 양쪽 모두 Fence·Continuous Updates와 TurboVNC식 혼잡 제어, 원격 화면 크기 변경, 커서 모양, 확장 클립보드, QEMU 키 코드(한/영·한자 키 → `Hangul`/`Hangul_Hanja`), LED 상태, 확장 마우스 버튼을 지원합니다. 보안 확장(TLS 등)은 M6에서 합니다. 상세 분석과 구현 계획은 [DEVPLAN.md](DEVPLAN.md)를 참고하세요.
 
 ---
 
@@ -79,19 +79,23 @@ cargo build --release
 cargo build --release --workspace --features rfb-codec/turbojpeg   # libjpeg-turbo 사용
 ```
 
-## 현재 시험해 볼 수 있는 것 (M4)
+## 현재 시험해 볼 수 있는 것 (M5)
 
 ```sh
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
 echo secret12 | minivnc-passwd -f > passwd
 
 # Linux: Xvfb + xfce4 세션을 공유, 포트 5901
-# (WSLg에서는 GTK 앱이 Wayland로 가지 않도록 WAYLAND_DISPLAY를 지운다)
-Xvfb :1 -screen 0 1920x1080x24 &
+# (WSLg에서는 GTK 앱이 Wayland로 가지 않도록 WAYLAND_DISPLAY를 지운다.
+#  Xvfb는 시작 크기보다 커질 수 없으므로, 뷰어 창에 맞춰 크기를 바꾸려면
+#  크게 시작한다)
+Xvfb :1 -screen 0 3840x2160x24 &
 env -u WAYLAND_DISPLAY DISPLAY=:1 dbus-launch --exit-with-session startxfce4 &
 minivnc-server :1 -display :1 -rfbauth passwd
 # 그 밖의 옵션: -deferupdate MS, -viewonly, -localhost, -securitytypes none,
-#   -alwaysshared / -nevershared / -disconnect, -pointerlocktimeout MS
+#   -alwaysshared / -nevershared / -disconnect, -pointerlocktimeout MS,
+#   -noflowcontrol, -noremoteresize, -maxclipboard BYTES, -noclipboardsend,
+#   -noclipboardrecv, -noprimarysync
 
 # 테스트 화면 서버(모든 플랫폼): 움직이는 패턴 또는 PNG 파일/디렉터리, 포트 5902
 minivnc-server :2 -rfbauth passwd -source pattern -geometry 800x600
@@ -101,7 +105,10 @@ minivnc-server :2 -rfbauth passwd -source png:shots/
 minivnc-viewer myhost:1
 minivnc-viewer myhost:1 -PasswordFile=passwd -Quality=80 -Subsampling=2X
 minivnc-viewer myhost::5901 -JPEG=0 -CompressLevel=0   # 무손실
-# 그 밖의 옵션: -Password=PW, -Encoding=Tight|Raw, -Shared=0, -ViewOnly
+# 그 밖의 옵션: -Password=PW, -Encoding=Tight|Raw, -Shared=0, -ViewOnly,
+#   -DesktopSize=Auto|Server (Auto: 창 크기에 맞춰 원격 화면 크기를 바꾼다)
+# 최대화 버튼: 전체 화면. 위쪽 가장자리 가운데에 마우스를 대면
+#   최소화·복원·닫기 바가 나타난다.
 
 # 아무 VNC 서버에 접속해 화면을 PNG로 저장하고 받은 바이트 수를 출력
 # (프리셋: lossless, lossless-zlib, perceptual, medium, low, raw)

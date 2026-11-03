@@ -1,11 +1,13 @@
 //! Platform-independent RFB server engine.
 //!
 //! A [`FrameSource`] runs on its own thread and writes into the shared
-//! framebuffer; each client connection is a tokio task that is told about
-//! changed areas through a broadcast channel. Input from clients goes to an
+//! screen; each client connection is a tokio task that is told about
+//! changes through a broadcast channel. Input from clients goes to an
 //! [`InputSink`] on another thread.
 
+mod cursor;
 mod encodings;
+mod flow;
 mod session;
 pub mod source;
 
@@ -17,33 +19,99 @@ use std::time::{Duration, Instant};
 
 use rfb_auth::Passwords;
 use rfb_codec::Framebuffer;
-use rfb_proto::consts::{SEC_TYPE_NONE, SEC_TYPE_VNC_AUTH};
+use rfb_proto::consts::{EDS_RESULT_PROHIBITED, LED_UNKNOWN, SEC_TYPE_NONE, SEC_TYPE_VNC_AUTH};
+use rfb_proto::msg::DEFAULT_MAX_CUT_TEXT;
 use rfb_region::Region;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, oneshot};
 use tracing::{error, info, warn};
 
-pub use source::FrameSource;
+pub use source::{Changes, Cursor, FrameSource};
 
-/// How long the capture thread waits for damage before checking whether the
-/// server is still alive.
+/// How long the capture thread waits for changes before checking whether
+/// the server is still alive.
 const CAPTURE_POLL: Duration = Duration::from_millis(200);
 
-/// Receives keyboard and pointer input from clients. Runs on its own thread,
-/// so calls may block.
+/// Receives input from clients. Runs on its own thread, so calls may block.
 pub trait InputSink: Send + 'static {
     fn key(&mut self, down: bool, keysym: u32) -> io::Result<()>;
+
+    /// Whether [`qemu_key`](Self::qemu_key) uses the key code. If not, the
+    /// QEMU Extended Key Event extension is not offered.
+    fn qemu_keys(&self) -> bool {
+        false
+    }
+
+    /// A key identified by its XT scan code ("qnum"; 0x80 marks E0-prefixed
+    /// keys), with the keysym as a fallback.
+    fn qemu_key(&mut self, down: bool, keysym: u32, keycode: u32) -> io::Result<()> {
+        let _ = keycode;
+        self.key(down, keysym)
+    }
+
     /// Absolute position and button mask (bit 0 = button 1).
     fn pointer(&mut self, x: u16, y: u16, buttons: u16) -> io::Result<()>;
+
     /// Releases every pressed key, so nothing stays stuck.
     fn release_all_keys(&mut self) -> io::Result<()>;
+
+    /// Puts text from a client on the desktop clipboard.
+    fn set_clipboard(&mut self, text: &str) -> io::Result<()> {
+        let _ = text;
+        Ok(())
+    }
+
+    /// Resizes the desktop and returns the size actually set, which may be
+    /// smaller than asked, or an `EDS_RESULT_*` error code. If the size
+    /// changed, the source reports it with [`Changes::resized`].
+    fn set_desktop_size(&mut self, width: u16, height: u16) -> Result<(u16, u16), u16> {
+        let _ = (width, height);
+        Err(EDS_RESULT_PROHIBITED)
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
 pub(crate) enum InputEvent {
-    Key { down: bool, keysym: u32 },
-    Pointer { x: u16, y: u16, buttons: u16 },
+    Key {
+        down: bool,
+        keysym: u32,
+    },
+    QemuKey {
+        down: bool,
+        keysym: u32,
+        keycode: u32,
+    },
+    Pointer {
+        x: u16,
+        y: u16,
+        buttons: u16,
+    },
     ReleaseAllKeys,
+    Clipboard(String),
+    DesktopSize {
+        width: u16,
+        height: u16,
+        result: oneshot::Sender<Result<(u16, u16), u16>>,
+    },
+}
+
+/// A change broadcast to the client sessions.
+#[derive(Clone, Debug)]
+pub(crate) enum Update {
+    /// `screen` changed in both framebuffers, `cursor` only where the
+    /// cursor is drawn in.
+    Damage {
+        screen: Region,
+        cursor: Region,
+    },
+    CursorShape,
+    PointerMoved,
+    /// The screen size changed, at the request of client `by` if any.
+    Resized {
+        by: Option<u64>,
+    },
+    Leds,
+    Bell,
+    Clipboard,
 }
 
 /// How a client that does not ask to share the desktop is treated
@@ -76,6 +144,16 @@ pub struct Config {
     /// While one client drags (holds a button), other clients' pointer
     /// events are ignored for up to this long (`-pointerlocktimeout`).
     pub pointer_lock_timeout: Duration,
+    /// TCP Vegas-style congestion control for clients with fences.
+    pub congestion_control: bool,
+    /// Let clients resize the desktop (TurboVNC `no-remote-resize` off).
+    pub remote_resize: bool,
+    /// Clipboard transfer limit in bytes (`-maxclipboard`).
+    pub max_clipboard: usize,
+    /// Send the desktop clipboard to clients (`-noclipboardsend` off).
+    pub clipboard_send: bool,
+    /// Accept clipboard text from clients (`-noclipboardrecv` off).
+    pub clipboard_recv: bool,
 }
 
 impl Default for Config {
@@ -90,8 +168,31 @@ impl Default for Config {
             view_only: false,
             sharing: Sharing::default(),
             pointer_lock_timeout: Duration::from_millis(3000),
+            congestion_control: true,
+            remote_resize: true,
+            max_clipboard: DEFAULT_MAX_CUT_TEXT,
+            clipboard_send: true,
+            clipboard_recv: true,
         }
     }
+}
+
+/// The current screen. `drawn` is `plain` with the cursor drawn in, for
+/// clients that do not take cursor shape updates.
+pub(crate) struct Screen {
+    pub plain: Framebuffer,
+    pub drawn: Framebuffer,
+    pub cursor: Option<Arc<Cursor>>,
+    pub pointer: (u16, u16),
+}
+
+/// Desktop state other than pixels.
+pub(crate) struct Desktop {
+    /// `LED_*` bits or `LED_UNKNOWN`.
+    pub leds: u32,
+    pub clipboard: Option<Arc<str>>,
+    /// Client whose `SetDesktopSize` is being carried out.
+    pub resizing: Option<u64>,
 }
 
 /// Connected clients and who owns the pointer.
@@ -110,22 +211,63 @@ struct ClientEntry {
 
 pub(crate) struct Shared {
     config: Config,
-    fb: RwLock<Framebuffer>,
-    damage: broadcast::Sender<Region>,
+    screen: RwLock<Screen>,
+    desktop: Mutex<Desktop>,
+    updates: broadcast::Sender<Update>,
     input: Option<mpsc::Sender<InputEvent>>,
+    /// The input sink takes QEMU key codes.
+    qemu_keys: bool,
     clients: Mutex<Clients>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Shared {
     fn clients(&self) -> std::sync::MutexGuard<'_, Clients> {
-        self.clients.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.clients)
     }
 
-    fn send_input(&self, event: InputEvent) {
-        if let Some(input) = &self.input {
+    pub(crate) fn desktop(&self) -> std::sync::MutexGuard<'_, Desktop> {
+        lock(&self.desktop)
+    }
+
+    pub(crate) fn screen(&self) -> std::sync::RwLockReadGuard<'_, Screen> {
+        self.screen.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn send_input(&self, event: InputEvent) -> bool {
+        match &self.input {
             // A closed channel means the input thread failed; it logged why.
-            let _ = input.send(event);
+            Some(input) => input.send(event).is_ok(),
+            None => false,
         }
+    }
+
+    /// Asks the input sink to resize the desktop; returns the size set or
+    /// an `EDS_RESULT_*` error code.
+    pub(crate) async fn set_desktop_size(
+        &self,
+        id: u64,
+        width: u16,
+        height: u16,
+    ) -> Result<(u16, u16), u16> {
+        let (result, rx) = oneshot::channel();
+        self.desktop().resizing = Some(id);
+        let sent = self.send_input(InputEvent::DesktopSize {
+            width,
+            height,
+            result,
+        });
+        let outcome = match sent {
+            true => rx.await.unwrap_or(Err(EDS_RESULT_PROHIBITED)),
+            false => Err(EDS_RESULT_PROHIBITED),
+        };
+        if outcome.is_err() {
+            self.desktop().resizing = None;
+        }
+        outcome
     }
 
     /// Applies the sharing policy once a client has finished the handshake.
@@ -215,10 +357,10 @@ impl Server {
         rfb_codec::translate::validate(&source.format())
             .map_err(|e| invalid(&format!("frame source: {e}")))?;
 
-        let mut fb = Framebuffer::new(source.width(), source.height(), source.format());
-        source.read(&Region::from(source::to_region_rect(fb.bounds())), &mut fb)?;
-        let (damage, _) = broadcast::channel(64);
+        let plain = read_all(&mut source)?;
+        let (updates, _) = broadcast::channel(256);
 
+        let qemu_keys = input.as_ref().is_some_and(|i| i.qemu_keys());
         let input = match input {
             Some(sink) => {
                 let (tx, rx) = mpsc::channel();
@@ -232,9 +374,20 @@ impl Server {
 
         let shared = Arc::new(Shared {
             config,
-            fb: RwLock::new(fb),
-            damage,
+            screen: RwLock::new(Screen {
+                drawn: plain.clone(),
+                plain,
+                cursor: None,
+                pointer: (0, 0),
+            }),
+            desktop: Mutex::new(Desktop {
+                leds: LED_UNKNOWN,
+                clipboard: None,
+                resizing: None,
+            }),
+            updates,
             input,
+            qemu_keys,
             clients: Mutex::default(),
         });
 
@@ -286,8 +439,23 @@ fn input_loop(mut sink: Box<dyn InputSink>, events: mpsc::Receiver<InputEvent>) 
     for event in events {
         let result = match event {
             InputEvent::Key { down, keysym } => sink.key(down, keysym),
+            InputEvent::QemuKey {
+                down,
+                keysym,
+                keycode,
+            } => sink.qemu_key(down, keysym, keycode),
             InputEvent::Pointer { x, y, buttons } => sink.pointer(x, y, buttons),
             InputEvent::ReleaseAllKeys => sink.release_all_keys(),
+            InputEvent::Clipboard(text) => sink.set_clipboard(&text),
+            InputEvent::DesktopSize {
+                width,
+                height,
+                result,
+            } => {
+                // The session may have gone away meanwhile.
+                let _ = result.send(sink.set_desktop_size(width, height));
+                Ok(())
+            }
         };
         if let Err(e) = result {
             error!("input injection failed: {e}");
@@ -295,10 +463,32 @@ fn input_loop(mut sink: Box<dyn InputSink>, events: mpsc::Receiver<InputEvent>) 
     }
 }
 
+fn bounds(fb: &Framebuffer) -> Region {
+    Region::from(source::to_region_rect(fb.bounds()))
+}
+
+fn read_all(source: &mut impl FrameSource) -> io::Result<Framebuffer> {
+    let mut fb = Framebuffer::new(source.width(), source.height(), source.format());
+    source.read(&bounds(&fb), &mut fb)?;
+    Ok(fb)
+}
+
+/// Copies `region` (inside both) from `src` to `dst`.
+fn copy_region(dst: &mut Framebuffer, src: &Framebuffer, region: &Region) {
+    for r in region.rects() {
+        let r = source::to_wire_rect(r);
+        let mut rows = Vec::with_capacity(r.area() as usize * src.bytes_per_pixel());
+        for y in 0..r.h {
+            rows.extend_from_slice(src.rect_row(r, y));
+        }
+        dst.put_rect(r, &rows).expect("same size framebuffers");
+    }
+}
+
 fn capture_loop(mut source: impl FrameSource, shared: Weak<Shared>) {
     loop {
-        let damage = match source.wait_damage(CAPTURE_POLL) {
-            Ok(d) => d,
+        let changes = match source.wait_changes(CAPTURE_POLL) {
+            Ok(c) => c,
             Err(e) => {
                 error!("frame source failed: {e}");
                 return;
@@ -307,17 +497,98 @@ fn capture_loop(mut source: impl FrameSource, shared: Weak<Shared>) {
         let Some(shared) = shared.upgrade() else {
             return;
         };
-        if damage.is_empty() {
+        if changes.is_empty() {
             continue;
         }
-        let mut fb = shared.fb.write().unwrap_or_else(|e| e.into_inner());
-        let damage = damage.intersect(&Region::from(source::to_region_rect(fb.bounds())));
-        if let Err(e) = source.read(&damage, &mut fb) {
+        if let Err(e) = apply(&mut source, &shared, changes) {
             error!("frame source read failed: {e}");
             return;
         }
-        drop(fb);
-        // No receivers just means no clients are connected.
-        let _ = shared.damage.send(damage);
     }
+}
+
+/// Brings the shared screen and desktop state up to date with `changes`
+/// and tells the sessions.
+fn apply(source: &mut impl FrameSource, shared: &Shared, changes: Changes) -> io::Result<()> {
+    // No receivers just means no clients are connected.
+    let notify = |u: Update| {
+        let _ = shared.updates.send(u);
+    };
+    let mut guard = shared.screen.write().unwrap_or_else(|e| e.into_inner());
+    let screen = &mut *guard;
+    let old_cursor = screen
+        .cursor
+        .as_deref()
+        .map(|c| cursor::area(c, screen.pointer));
+    let cursor_changed = changes.cursor.is_some();
+    let moved = changes.pointer.is_some_and(|p| p != screen.pointer);
+    if let Some(c) = changes.cursor {
+        screen.cursor = Some(Arc::new(c));
+    }
+    if let Some(p) = changes.pointer {
+        screen.pointer = p;
+    }
+    let new_cursor = screen
+        .cursor
+        .as_deref()
+        .map(|c| cursor::area(c, screen.pointer));
+
+    if changes.resized {
+        screen.plain = read_all(source)?;
+        screen.drawn = screen.plain.clone();
+        if let (Some(c), Some(area)) = (screen.cursor.as_deref(), &new_cursor) {
+            cursor::draw(&mut screen.drawn, c, screen.pointer, area);
+        }
+        drop(guard);
+        let by = shared.desktop().resizing.take();
+        info!("desktop resized to {}x{}", source.width(), source.height());
+        notify(Update::Resized { by });
+    } else {
+        let all = bounds(&screen.plain);
+        let damage = changes.damage.intersect(&all);
+        if !damage.is_empty() {
+            source.read(&damage, &mut screen.plain)?;
+        }
+        let cursor_dirty = if cursor_changed || moved {
+            let mut r = old_cursor.unwrap_or_default();
+            if let Some(n) = &new_cursor {
+                r = r.union(n);
+            }
+            r.intersect(&all)
+        } else {
+            Region::new()
+        };
+        let redraw = damage.union(&cursor_dirty);
+        copy_region(&mut screen.drawn, &screen.plain, &redraw);
+        if let Some(c) = screen.cursor.as_deref() {
+            cursor::draw(&mut screen.drawn, c, screen.pointer, &redraw);
+        }
+        drop(guard);
+        let cursor_only = cursor_dirty.subtract(&damage);
+        if !damage.is_empty() || !cursor_only.is_empty() {
+            notify(Update::Damage {
+                screen: damage,
+                cursor: cursor_only,
+            });
+        }
+        if cursor_changed {
+            notify(Update::CursorShape);
+        }
+        if moved {
+            notify(Update::PointerMoved);
+        }
+    }
+
+    if let Some(leds) = changes.leds {
+        shared.desktop().leds = leds;
+        notify(Update::Leds);
+    }
+    if changes.bell {
+        notify(Update::Bell);
+    }
+    if let Some(text) = changes.clipboard {
+        shared.desktop().clipboard = Some(text.into());
+        notify(Update::Clipboard);
+    }
+    Ok(())
 }

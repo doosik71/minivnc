@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use rfb_codec::{Framebuffer, pack_rgb, write_pixel};
 use rfb_region::{Rect, Region};
 
-use super::{FrameSource, RGB888, to_wire_rect};
+use super::{Changes, FrameSource, RGB888, to_wire_rect};
 
 /// Shows a PNG file, or cycles through the PNG files of a directory (sorted
 /// by name, all the same size) at a fixed interval.
@@ -126,28 +126,28 @@ impl FrameSource for PngSource {
         RGB888
     }
 
-    fn wait_damage(&mut self, timeout: Duration) -> io::Result<Region> {
+    fn wait_changes(&mut self, timeout: Duration) -> io::Result<Changes> {
         if self.frames.len() == 1 {
             thread::sleep(timeout);
-            return Ok(Region::new());
+            return Ok(Changes::default());
         }
         let now = Instant::now();
         if self.next_switch > now {
             let wait = self.next_switch - now;
             if wait > timeout {
                 thread::sleep(timeout);
-                return Ok(Region::new());
+                return Ok(Changes::default());
             }
             thread::sleep(wait);
         }
         self.next_switch += self.interval;
         self.current = (self.current + 1) % self.frames.len();
-        Ok(Region::from(Rect::from_xywh(
+        Ok(Changes::from(Region::from(Rect::from_xywh(
             0,
             0,
             self.width().into(),
             self.height().into(),
-        )))
+        ))))
     }
 
     fn read(&mut self, region: &Region, fb: &mut Framebuffer) -> io::Result<()> {
@@ -216,7 +216,10 @@ mod tests {
         for _ in 0..3 {
             src.read(&all, &mut fb).unwrap();
             seen.push(fb.to_rgb8());
-            assert_eq!(src.wait_damage(Duration::from_secs(1)).unwrap(), all);
+            assert_eq!(
+                src.wait_changes(Duration::from_secs(1)).unwrap().damage,
+                all
+            );
         }
         assert_eq!(
             seen,

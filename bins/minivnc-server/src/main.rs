@@ -42,6 +42,12 @@ usage: minivnc-server [:N] [options]
   -pointerlocktimeout MS
                         how long a dragging viewer keeps the pointer from
                         others (default 3000)
+  -noflowcontrol        disable congestion control
+  -noremoteresize       do not let viewers resize the desktop
+  -maxclipboard BYTES   clipboard transfer limit (default 1048576)
+  -noclipboardsend      do not send the desktop clipboard to viewers
+  -noclipboardrecv      do not accept clipboard changes from viewers
+  -noprimarysync        leave the PRIMARY selection alone (X11)
 
 Set RUST_LOG (e.g. RUST_LOG=debug) to change the log level.";
 
@@ -64,6 +70,12 @@ struct Options {
     view_only: bool,
     sharing: Sharing,
     pointer_lock_timeout: Duration,
+    congestion_control: bool,
+    remote_resize: bool,
+    max_clipboard: usize,
+    clipboard_send: bool,
+    clipboard_recv: bool,
+    primary_sync: bool,
 }
 
 fn parse_ms(v: &str, name: &str) -> Result<Duration, String> {
@@ -90,6 +102,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         view_only: false,
         sharing: Sharing::default(),
         pointer_lock_timeout: config.pointer_lock_timeout,
+        congestion_control: true,
+        remote_resize: true,
+        max_clipboard: config.max_clipboard,
+        clipboard_send: true,
+        clipboard_recv: true,
+        primary_sync: true,
     };
     let mut display = None;
     let mut rfbport = None;
@@ -135,6 +153,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
             "nevershared" => opts.sharing.never_shared = true,
             "disconnect" => opts.sharing.disconnect = true,
             "dontdisconnect" => opts.sharing.disconnect = false,
+            "noflowcontrol" => opts.congestion_control = false,
+            "noremoteresize" => opts.remote_resize = false,
+            "maxclipboard" => {
+                opts.max_clipboard = value(&arg)?.parse().map_err(|_| "bad -maxclipboard")?
+            }
+            "noclipboardsend" => opts.clipboard_send = false,
+            "noclipboardrecv" => opts.clipboard_recv = false,
+            "noprimarysync" => opts.primary_sync = false,
             "h" | "help" => return Err(String::new()),
             _ => return Err(format!("unknown option {arg}")),
         }
@@ -214,6 +240,11 @@ async fn run(opts: Options) -> std::io::Result<()> {
         view_only: opts.view_only,
         sharing: opts.sharing,
         pointer_lock_timeout: opts.pointer_lock_timeout,
+        congestion_control: opts.congestion_control,
+        remote_resize: opts.remote_resize,
+        max_clipboard: opts.max_clipboard,
+        clipboard_send: opts.clipboard_send,
+        clipboard_recv: opts.clipboard_recv,
     };
     let server = match opts.source {
         Source::Pattern => Server::start(
@@ -226,7 +257,7 @@ async fn run(opts: Options) -> std::io::Result<()> {
             PngSource::open(&path, Duration::from_secs(1))?,
             None,
         )?,
-        Source::X11(display) => start_x11(config, display.as_deref())?,
+        Source::X11(display) => start_x11(config, display.as_deref(), opts.primary_sync)?,
     };
 
     let ip = if opts.localhost {
@@ -240,8 +271,9 @@ async fn run(opts: Options) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn start_x11(config: Config, display: Option<&str>) -> std::io::Result<Server> {
-    let (source, input) = capture_x11::open(display)?;
+fn start_x11(config: Config, display: Option<&str>, primary_sync: bool) -> std::io::Result<Server> {
+    let max_clipboard = config.max_clipboard;
+    let (source, input) = capture_x11::open(display, primary_sync, max_clipboard)?;
     let name = display.map_or_else(
         || std::env::var("DISPLAY").unwrap_or_default(),
         str::to_string,
@@ -251,7 +283,11 @@ fn start_x11(config: Config, display: Option<&str>) -> std::io::Result<Server> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_x11(_config: Config, _display: Option<&str>) -> std::io::Result<Server> {
+fn start_x11(
+    _config: Config,
+    _display: Option<&str>,
+    _primary_sync: bool,
+) -> std::io::Result<Server> {
     Err(std::io::Error::other(
         "X11 capture is only available on Linux; use -source pattern or png:PATH",
     ))

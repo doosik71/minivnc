@@ -2,12 +2,14 @@
 //! X display such as Xvfb or Xorg.
 
 mod capture;
+mod clipboard;
 mod input;
 mod shm;
 
 use std::io;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixStream};
+use std::sync::mpsc;
 
 use rfb_proto::PixelFormat;
 use x11rb::connection::Connection;
@@ -17,6 +19,7 @@ use x11rb::reexports::x11rb_protocol::xauth::get_auth;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
 pub use capture::X11Source;
+use clipboard::Clipboard;
 pub use input::X11Input;
 
 fn xerr(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -109,11 +112,34 @@ fn connect(display: Option<&str>) -> io::Result<(RustConnection, usize)> {
     Ok((conn, screen))
 }
 
-/// Opens `display` (or `$DISPLAY`) twice: one connection captures, the other
-/// injects input, so each runs on its own thread.
-pub fn open(display: Option<&str>) -> io::Result<(X11Source, X11Input)> {
+/// Opens `display` (or `$DISPLAY`) three times: for capture, for input
+/// injection and for clipboard synchronisation, each on its own thread.
+/// `primary_sync` also synchronises the PRIMARY selection; clipboard text
+/// from the desktop is limited to `max_clipboard` bytes.
+pub fn open(
+    display: Option<&str>,
+    primary_sync: bool,
+    max_clipboard: usize,
+) -> io::Result<(X11Source, X11Input)> {
     let (conn, screen) = connect(display)?;
     let d = describe_display(&conn, screen)?;
     let (input_conn, _) = connect(display)?;
-    Ok((X11Source::new(conn, d)?, X11Input::new(input_conn, d.root)?))
+    let (clip_conn, _) = connect(display)?;
+    let (to_clients, from_desktop) = mpsc::channel();
+    let (to_desktop, from_clients) = mpsc::channel();
+    let clipboard = Clipboard::new(
+        clip_conn,
+        d.root,
+        primary_sync,
+        max_clipboard,
+        to_clients,
+        from_clients,
+    )?;
+    std::thread::Builder::new()
+        .name("clipboard".into())
+        .spawn(move || clipboard.run())?;
+    Ok((
+        X11Source::new(conn, d, from_desktop)?,
+        X11Input::new(input_conn, d.root, to_desktop)?,
+    ))
 }

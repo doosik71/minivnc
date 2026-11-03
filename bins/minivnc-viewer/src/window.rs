@@ -1,29 +1,34 @@
 //! The viewer window: draws the remote screen with softbuffer and turns
 //! keyboard and mouse events into RFB input.
 //!
-//! The window starts at the remote size and cannot grow past it. When it
-//! is smaller, scroll bars appear; dragging them pans the view.
+//! The window starts at the remote size. With `-DesktopSize=Server` it
+//! cannot grow past it; with `Auto` the remote desktop is resized to fit
+//! the window when the server allows. Whenever the window is smaller,
+//! scroll bars appear; dragging them pans the view.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use rfb_client::{Client, ClientError};
-use rfb_proto::msg::ClientMessage;
+use rfb_client::{Client, ClientError, CursorShape};
+use rfb_proto::consts::{EDS_REASON_CLIENT, LED_CAPS_LOCK, LED_NUM_LOCK, LED_SCROLL_LOCK};
+use rfb_proto::msg::{ClientMessage, Screen as ScreenDesc};
 use softbuffer::Surface;
-use tracing::debug;
+use tracing::{debug, info};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
-use winit::window::{CustomCursor, Window, WindowId};
+use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
-use crate::conn::{self, Reader, SharedScreen, Writer};
-use crate::keys;
+use crate::conn::{self, Notice, Reader, SharedClipboard, SharedScreen, Writer};
+use crate::connbar;
+use crate::{Options, keys, platform};
 
 /// Scroll bar thickness in pixels.
 const BAR: u32 = 14;
@@ -32,10 +37,21 @@ const TRACK: u32 = 0xe0_e0_e0;
 const THUMB: u32 = 0x90_90_90;
 /// Touchpad pixels per wheel click.
 const PIXELS_PER_CLICK: f64 = 40.0;
+/// How long the window size must stay put before the remote desktop is
+/// resized to it.
+const RESIZE_DELAY: Duration = Duration::from_millis(500);
+/// After leaving full-screen mode, the window may still report itself
+/// maximized for a moment; do not go back to full screen meanwhile.
+const RESTORE_GUARD: Duration = Duration::from_secs(1);
+/// Lock keys: LED bit, keysym and XT scan code.
+const LOCK_KEYS: [(u32, u32, u32); 3] = [
+    (LED_CAPS_LOCK, 0xffe5, 0x3a),
+    (LED_NUM_LOCK, 0xff7f, 0x45),
+    (LED_SCROLL_LOCK, 0xff14, 0x46),
+];
 
 enum UserEvent {
-    /// The screen changed.
-    Damaged,
+    Notice(Notice),
     /// The connection ended, with the reason.
     Closed(String),
 }
@@ -82,12 +98,21 @@ fn thumb(track: u32, view: u32, remote: u32, offset: u32) -> (u32, u32) {
     (pos.min(track.saturating_sub(len)), len.min(track))
 }
 
+/// What was sent for a pressed key, so its release matches.
+#[derive(Clone, Copy)]
+struct SentKey {
+    keysym: u32,
+    qnum: Option<u32>,
+}
+
 struct App {
     title: String,
     remote: (u32, u32),
     screen: SharedScreen,
     writer: Writer,
+    clipboard: SharedClipboard,
     view_only: bool,
+    auto_resize: bool,
     damage_pending: Arc<AtomicBool>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -98,17 +123,102 @@ struct App {
     buttons: u16,
     /// Scroll bar being dragged.
     dragging: Option<Axis>,
-    /// Keysym sent for each pressed key, so its release matches.
-    pressed: HashMap<PhysicalKey, u32>,
+    pressed: HashMap<PhysicalKey, SentKey>,
     /// Wheel movement not yet sent, in clicks.
     wheel: (f64, f64),
+    /// Server extensions confirmed so far.
+    qemu_keys: bool,
+    ext_mouse_buttons: bool,
+    remote_resize: bool,
+    /// The server's lock key state, once known.
+    server_leds: Option<u32>,
+    /// A SetDesktopSize was sent and not answered yet. The server may set
+    /// a smaller size than asked; the window then keeps its size and shows
+    /// a margin.
+    awaiting_resize: bool,
+    /// When to resize the remote desktop to the window (Auto mode).
+    resize_at: Option<Instant>,
+    /// The full-screen connection bar is showing.
+    connbar: bool,
+    /// Until when maximizing does not switch to full screen.
+    restore_guard: Option<Instant>,
     error: Option<String>,
 }
 
 impl App {
+    fn fullscreen(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|w| w.fullscreen().is_some())
+    }
+
+    fn width(&self) -> u32 {
+        self.window.as_ref().map_or(0, |w| w.inner_size().width)
+    }
+
+    /// Full screen on the window's monitor, with no title bar.
+    fn enter_fullscreen(&mut self) {
+        if let Some(w) = &self.window {
+            w.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
+    }
+
+    /// Back to a normal window, not maximized.
+    fn leave_fullscreen(&mut self) {
+        self.connbar = false;
+        self.restore_guard = Some(Instant::now() + RESTORE_GUARD);
+        if let Some(w) = &self.window {
+            w.set_fullscreen(None);
+            w.set_maximized(false);
+        }
+    }
+
+    /// Shows or hides the connection bar as the pointer moves. Returns
+    /// whether the pointer is over the bar, so the motion is not sent.
+    fn track_connbar(&mut self) -> bool {
+        if !self.fullscreen() {
+            self.connbar = false;
+            return false;
+        }
+        let width = self.width();
+        let over = if self.connbar {
+            connbar::contains(width, self.cursor)
+        } else {
+            connbar::triggered(width, self.cursor)
+        };
+        if over != self.connbar {
+            debug!(cursor = ?self.cursor, "connection bar {}", if over { "shown" } else { "hidden" });
+        }
+        if over != self.connbar || over {
+            self.connbar = over;
+            self.redraw();
+        }
+        over
+    }
+
+    /// A click on the connection bar.
+    fn connbar_click(&mut self, event_loop: &ActiveEventLoop) {
+        match connbar::button_at(self.width(), self.cursor) {
+            Some(connbar::Button::Minimize) => {
+                self.connbar = false;
+                if let Some(w) = &self.window {
+                    w.set_minimized(true);
+                }
+            }
+            Some(connbar::Button::Restore) => self.leave_fullscreen(),
+            Some(connbar::Button::Close) => event_loop.exit(),
+            None => {}
+        }
+    }
     fn layout(&self) -> Option<Layout> {
         let size = self.window.as_ref()?.inner_size();
         Some(layout((size.width, size.height), self.remote))
+    }
+
+    fn redraw(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     fn clamp_offset(&mut self, l: Layout) {
@@ -124,6 +234,20 @@ impl App {
         if let Err(e) = self.writer.send(&msg) {
             debug!("send failed: {e}");
         }
+    }
+
+    fn send_key(&self, key: SentKey, down: bool) {
+        self.send(match key.qnum {
+            Some(keycode) => ClientMessage::QemuKeyEvent {
+                down,
+                keysym: key.keysym,
+                keycode,
+            },
+            None => ClientMessage::KeyEvent {
+                down,
+                keysym: key.keysym,
+            },
+        });
     }
 
     fn send_pointer(&self) {
@@ -167,9 +291,7 @@ impl App {
             Axis::Vertical => self.offset.1 = offset,
         }
         self.clamp_offset(l);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.redraw();
     }
 
     /// Wheel clicks are presses and releases of buttons 4-7.
@@ -219,14 +341,16 @@ impl App {
         let (w, h) = (size.width as usize, size.height as usize);
         let (vw, vh) = (l.view.0 as usize, l.view.1 as usize);
         let (ox, oy) = (self.offset.0 as usize, self.offset.1 as usize);
+        // The screen may already have a new size the window has not heard
+        // of yet; it is what gets drawn.
         let screen = self.screen.lock();
         let (rw, rh) = (usize::from(screen.width), usize::from(screen.height));
         let vthumb = thumb(l.view.1, l.view.1, self.remote.1, self.offset.1);
         let hthumb = thumb(l.view.0, l.view.0, self.remote.0, self.offset.0);
         for (y, row) in buf.chunks_exact_mut(w).take(h).enumerate() {
             if y < vh {
-                let n = if oy + y < rh {
-                    let n = vw.min(rw.saturating_sub(ox));
+                let n = if oy + y < rh && ox < rw {
+                    let n = vw.min(rw - ox);
                     let start = (oy + y) * rw + ox;
                     row[..n].copy_from_slice(&screen.pixels[start..start + n]);
                     n
@@ -251,21 +375,152 @@ impl App {
             }
         }
         drop(screen);
+        if self.connbar {
+            let hover = connbar::button_at(size.width, self.cursor);
+            connbar::draw(&mut buf, size.width, size.height, hover);
+        }
         buf.present()
     }
 
     fn release_all_keys(&mut self) {
-        for (_, keysym) in std::mem::take(&mut self.pressed) {
-            self.send(ClientMessage::KeyEvent {
-                down: false,
-                keysym,
-            });
+        for (_, key) in std::mem::take(&mut self.pressed) {
+            self.send_key(key, false);
         }
+    }
+
+    /// Makes the server's lock keys match the local keyboard by toggling
+    /// them on the server; the local keyboard is left alone.
+    fn sync_lock_keys(&mut self) {
+        let (Some(server), Some(local)) = (self.server_leds, platform::lock_keys()) else {
+            return;
+        };
+        if !self.qemu_keys || self.view_only || server == local {
+            return;
+        }
+        for (bit, keysym, qnum) in LOCK_KEYS {
+            if (server ^ local) & bit != 0 {
+                let key = SentKey {
+                    keysym,
+                    qnum: Some(qnum),
+                };
+                self.send_key(key, true);
+                self.send_key(key, false);
+            }
+        }
+        debug!("lock keys synchronised: {server:#x} -> {local:#x}");
+        // Until the server reports its new state.
+        self.server_leds = Some(local);
+    }
+
+    /// Offers the local clipboard to the server if it changed.
+    fn announce_clipboard(&self) {
+        if self.view_only {
+            return;
+        }
+        let text = arboard::Clipboard::new().and_then(|mut c| c.get_text());
+        if let Ok(text) = text
+            && let Err(e) = conn::announce_clipboard(&self.writer, &self.clipboard, text)
+        {
+            debug!("send failed: {e}");
+        }
+    }
+
+    fn set_cursor(&self, event_loop: &ActiveEventLoop, shape: CursorShape) {
+        let Some(window) = &self.window else { return };
+        if shape.rgba.is_empty() {
+            window.set_cursor_visible(false);
+            return;
+        }
+        let hot = (
+            shape.hot_x.min(shape.width.saturating_sub(1)),
+            shape.hot_y.min(shape.height.saturating_sub(1)),
+        );
+        match CustomCursor::from_rgba(shape.rgba, shape.width, shape.height, hot.0, hot.1) {
+            Ok(source) => {
+                window.set_cursor(event_loop.create_custom_cursor(source));
+                window.set_cursor_visible(true);
+            }
+            Err(e) => debug!("unusable cursor: {e}"),
+        }
+    }
+
+    fn notice(&mut self, event_loop: &ActiveEventLoop, notice: Notice) {
+        match notice {
+            Notice::Damaged => {
+                self.damage_pending.store(false, Ordering::Release);
+                self.redraw();
+            }
+            Notice::DesktopSize { width, height } => {
+                self.remote = (u32::from(width), u32::from(height));
+                if let Some(window) = &self.window {
+                    let size = PhysicalSize::new(u32::from(width), u32::from(height));
+                    let inner = window.inner_size();
+                    if !self.auto_resize {
+                        window.set_max_inner_size(Some(size));
+                    }
+                    // A server-side change: follow it with the window.
+                    let ours =
+                        self.auto_resize && (self.awaiting_resize || self.resize_at.is_some());
+                    if (inner.width, inner.height) != self.remote && !ours {
+                        let _ = window.request_inner_size(size);
+                    }
+                }
+                self.redraw();
+            }
+            Notice::ExtendedDesktopSize { reason, result } => {
+                if reason == EDS_REASON_CLIENT {
+                    self.awaiting_resize = false;
+                    if result != 0 {
+                        info!("the server refused to resize the desktop (result {result})");
+                    }
+                }
+                self.remote_resize = true;
+            }
+            Notice::Cursor(shape) => self.set_cursor(event_loop, shape),
+            Notice::Bell => platform::bell(),
+            Notice::Leds(state) => {
+                self.server_leds = Some(state);
+                self.sync_lock_keys();
+            }
+            Notice::QemuKeys => {
+                info!("using QEMU key codes");
+                self.qemu_keys = true;
+            }
+            Notice::ExtendedMouseButtons => self.ext_mouse_buttons = true,
+        }
+    }
+
+    /// Auto mode: asks the server for the window's size.
+    fn resize_remote(&mut self) {
+        let Some(window) = &self.window else { return };
+        let size = window.inner_size();
+        let (w, h) = (
+            size.width.min(u32::from(u16::MAX)),
+            size.height.min(u32::from(u16::MAX)),
+        );
+        if (w, h) == self.remote || w == 0 || h == 0 {
+            return;
+        }
+        info!("asking the server to resize the desktop to {w}x{h}");
+        self.awaiting_resize = true;
+        let (w, h) = (w as u16, h as u16);
+        self.send(ClientMessage::SetDesktopSize {
+            width: w,
+            height: h,
+            screens: vec![ScreenDesc {
+                id: 0,
+                x: 0,
+                y: 0,
+                w,
+                h,
+                flags: 0,
+            }],
+        });
     }
 }
 
 /// A 5x5 dot (black with a white rim), the TurboVNC viewer's local cursor
-/// when the remote cursor is drawn by the server.
+/// until the server sends a cursor shape.
 fn dot_cursor() -> Vec<u8> {
     let mut rgba = Vec::with_capacity(5 * 5 * 4);
     for y in 0..5i32 {
@@ -287,10 +542,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let size = PhysicalSize::new(self.remote.0, self.remote.1);
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(&self.title)
-            .with_inner_size(size)
-            .with_max_inner_size(size);
+            .with_inner_size(size);
+        if !self.auto_resize {
+            attrs = attrs.with_max_inner_size(size);
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -317,16 +574,23 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Damaged => {
-                self.damage_pending.store(false, Ordering::Release);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
+            UserEvent::Notice(n) => self.notice(event_loop, n),
             UserEvent::Closed(reason) => {
                 self.error = Some(reason);
                 event_loop.exit();
             }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.resize_at {
+            Some(at) if Instant::now() >= at => {
+                self.resize_at = None;
+                self.resize_remote();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -339,10 +603,31 @@ impl ApplicationHandler<UserEvent> for App {
                     event_loop.exit();
                 }
             }
-            WindowEvent::Resized(_) => {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+            WindowEvent::Resized(size) => {
+                // The maximize button switches to full screen.
+                let guarded = self.restore_guard.is_some_and(|t| Instant::now() < t);
+                if let Some(w) = &self.window
+                    && w.is_maximized()
+                    && w.fullscreen().is_none()
+                    && !guarded
+                {
+                    self.enter_fullscreen();
                 }
+                if !self.fullscreen() {
+                    self.connbar = false;
+                }
+                if self.auto_resize
+                    && self.remote_resize
+                    && !self.view_only
+                    && (size.width, size.height) != self.remote
+                {
+                    self.resize_at = Some(Instant::now() + RESIZE_DELAY);
+                }
+                self.redraw();
+            }
+            WindowEvent::Focused(true) => {
+                self.sync_lock_keys();
+                self.announce_clipboard();
             }
             // Keys released while another window has the focus would
             // otherwise stay pressed on the server.
@@ -353,34 +638,57 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => match event.state {
                 ElementState::Pressed => {
-                    if let Some(keysym) =
-                        keys::keysym(&event.logical_key, event.physical_key, event.location)
-                    {
-                        self.pressed.insert(event.physical_key, keysym);
-                        self.send(ClientMessage::KeyEvent { down: true, keysym });
+                    let keysym =
+                        keys::keysym(&event.logical_key, event.physical_key, event.location);
+                    let qnum = self
+                        .qemu_keys
+                        .then(|| keys::qnum(&event.logical_key, event.physical_key))
+                        .flatten();
+                    if keysym.is_none() && qnum.is_none() {
+                        return;
                     }
+                    let key = SentKey {
+                        keysym: keysym.unwrap_or(0),
+                        qnum,
+                    };
+                    self.pressed.insert(event.physical_key, key);
+                    self.send_key(key, true);
                 }
                 ElementState::Released => {
-                    if let Some(keysym) = self.pressed.remove(&event.physical_key) {
-                        self.send(ClientMessage::KeyEvent {
-                            down: false,
-                            keysym,
-                        });
+                    if let Some(key) = self.pressed.remove(&event.physical_key) {
+                        self.send_key(key, false);
                     }
                 }
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                if self.dragging.is_none() && self.track_connbar() {
+                    return;
+                }
                 match self.dragging {
                     Some(axis) => self.drag_to_cursor(axis),
                     None => self.send_pointer(),
                 }
+            }
+            WindowEvent::MouseInput { state, button, .. }
+                if self.connbar && connbar::contains(self.width(), self.cursor) =>
+            {
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    self.connbar_click(event_loop);
+                }
+            }
+            WindowEvent::CursorLeft { .. } if self.connbar => {
+                self.connbar = false;
+                self.redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let bit = match button {
                     MouseButton::Left => 1,
                     MouseButton::Middle => 2,
                     MouseButton::Right => 4,
+                    // Buttons 8 and 9 need the extended pointer event.
+                    MouseButton::Back if self.ext_mouse_buttons => 1 << 7,
+                    MouseButton::Forward if self.ext_mouse_buttons => 1 << 8,
                     _ => return,
                 };
                 let pressed = state == ElementState::Pressed;
@@ -423,33 +731,39 @@ fn describe(e: &ClientError) -> String {
 
 /// Opens the window and runs the session until the window is closed or
 /// the connection ends.
-pub fn run(
-    client: Client<Reader>,
-    writer: Writer,
-    encodings: Vec<i32>,
-    view_only: bool,
-) -> Result<(), Box<dyn Error>> {
+pub fn run(client: Client<Reader>, writer: Writer, opts: &Options) -> Result<(), Box<dyn Error>> {
     let title = client.name().to_string();
     let fb = client.framebuffer();
     let (width, height) = (fb.width(), fb.height());
     let screen = SharedScreen::new(width, height);
+    let clipboard = SharedClipboard::new(Mutex::default());
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let damage_pending = Arc::new(AtomicBool::new(false));
 
+    let encodings = opts.encodings();
     let thread_screen = screen.clone();
+    let thread_clipboard = Arc::clone(&clipboard);
     let pending = Arc::clone(&damage_pending);
     std::thread::Builder::new()
         .name("rfb".into())
         .spawn(move || {
-            // One pending notice is enough: the window draws the latest
-            // screen whenever it gets to it.
-            let damaged = || {
-                if !pending.swap(true, Ordering::AcqRel) {
-                    let _ = proxy.send_event(UserEvent::Damaged);
+            let notify = |n: Notice| {
+                // One pending damage notice is enough: the window draws the
+                // latest screen whenever it gets to it.
+                if matches!(n, Notice::Damaged) && pending.swap(true, Ordering::AcqRel) {
+                    return;
                 }
+                let _ = proxy.send_event(UserEvent::Notice(n));
             };
-            let reason = match conn::run(client, &encodings, &thread_screen, damaged) {
+            let result = conn::run(
+                client,
+                &encodings,
+                &thread_screen,
+                &thread_clipboard,
+                notify,
+            );
+            let reason = match result {
                 Ok(()) => "connection closed".into(),
                 Err(e) => describe(&e),
             };
@@ -461,7 +775,9 @@ pub fn run(
         remote: (u32::from(width), u32::from(height)),
         screen,
         writer,
-        view_only,
+        clipboard,
+        view_only: opts.view_only,
+        auto_resize: opts.auto_resize,
         damage_pending,
         window: None,
         surface: None,
@@ -471,6 +787,14 @@ pub fn run(
         dragging: None,
         pressed: HashMap::new(),
         wheel: (0.0, 0.0),
+        qemu_keys: false,
+        ext_mouse_buttons: false,
+        remote_resize: false,
+        server_leds: None,
+        awaiting_resize: false,
+        resize_at: None,
+        connbar: false,
+        restore_guard: None,
         error: None,
     };
     event_loop.run_app(&mut app)?;

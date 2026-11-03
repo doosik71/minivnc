@@ -4,14 +4,16 @@
 //! returns one server message at a time, decoding framebuffer updates into
 //! [`Client::framebuffer`].
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 
 use rfb_auth::Password;
 use rfb_codec::tight::TightDecoder;
-use rfb_codec::{CodecError, DecodeError, Framebuffer, copyrect, raw};
+use rfb_codec::{CodecError, DecodeError, Framebuffer, copyrect, raw, read_pixel, unpack_rgb};
 use rfb_proto::consts::*;
 use rfb_proto::handshake::{ClientInit, SecurityOffer, SecurityResult, ServerInit, Version};
+pub use rfb_proto::msg::Screen;
 use rfb_proto::msg::{ClientMessage, CutText, RectHeader, ServerMessage, ServerParseCtx};
 use rfb_proto::{Parsed, PixelFormat, ProtoError, Rect};
 
@@ -115,6 +117,65 @@ pub enum Event {
         payload: Vec<u8>,
     },
     Gii,
+    /// The framebuffer was resized (DesktopSize, or an ExtendedDesktopSize
+    /// with a new size, which is reported first).
+    DesktopSize {
+        width: u16,
+        height: u16,
+    },
+    /// An ExtendedDesktopSize rectangle; the framebuffer was resized unless
+    /// it reports a failed request.
+    ExtendedDesktopSize {
+        reason: u16,
+        result: u16,
+        width: u16,
+        height: u16,
+        screens: Vec<Screen>,
+    },
+    /// New cursor shape (RichCursor or XCursor).
+    Cursor(CursorShape),
+    /// The server moved the pointer (PointerPos).
+    PointerPos {
+        x: u16,
+        y: u16,
+    },
+    /// The server accepts QEMU Extended Key Events.
+    QemuKeyEvents,
+    /// The server's lock key state (`LED_*` bits).
+    LedState(u32),
+    /// The server accepts extended pointer events (buttons 8 and up).
+    ExtendedMouseButtons,
+}
+
+/// A cursor image; empty when the server hides the cursor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CursorShape {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// Non-premultiplied RGBA, row by row; alpha is 0 or 255.
+    pub rgba: Vec<u8>,
+}
+
+/// Builds a cursor from per-pixel RGB, a 1bpp mask and the hotspot.
+fn cursor_shape(r: Rect, mask: &[u8], rgb: impl Fn(usize) -> [u8; 3]) -> CursorShape {
+    let row_bytes = usize::from(r.w).div_ceil(8);
+    let mut rgba = Vec::with_capacity(r.area() as usize * 4);
+    for y in 0..usize::from(r.h) {
+        for x in 0..usize::from(r.w) {
+            let opaque = mask[y * row_bytes + x / 8] & (0x80 >> (x % 8)) != 0;
+            rgba.extend(rgb(y * usize::from(r.w) + x));
+            rgba.push(if opaque { 255 } else { 0 });
+        }
+    }
+    CursorShape {
+        width: r.w,
+        height: r.h,
+        hot_x: r.x,
+        hot_y: r.y,
+        rgba,
+    }
 }
 
 /// Stream plus bytes received but not yet parsed.
@@ -177,6 +238,11 @@ impl<S: Read + Write> Conn<S> {
         Ok(v)
     }
 
+    fn read_vec(&mut self, n: usize) -> Result<Vec<u8>> {
+        self.ensure(n)?;
+        Ok(self.buf.drain(..n).collect())
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.stream.write_all(bytes)?;
         Ok(())
@@ -191,6 +257,9 @@ pub struct Client<S> {
     fb: Framebuffer,
     ctx: ServerParseCtx,
     tight: TightDecoder,
+    /// Events decoded but not returned yet: pseudo-rectangles come before
+    /// the update they arrived in.
+    pending: VecDeque<Event>,
 }
 
 impl<S: Read + Write> Client<S> {
@@ -269,6 +338,7 @@ impl<S: Read + Write> Client<S> {
             fb: Framebuffer::new(init.width, init.height, init.format),
             ctx: ServerParseCtx::default(),
             tight: TightDecoder::new(),
+            pending: VecDeque::new(),
         })
     }
 
@@ -303,7 +373,12 @@ impl<S: Read + Write> Client<S> {
         Ok(())
     }
 
+    /// Also enables reading Extended Clipboard messages if `encodings`
+    /// announces them.
     pub fn set_encodings(&mut self, encodings: &[i32]) -> Result<()> {
+        if encodings.contains(&ENCODING_EXTENDED_CLIPBOARD) {
+            self.ctx.ext_clipboard = true;
+        }
         self.send(&ClientMessage::SetEncodings(encodings.to_vec()))
     }
 
@@ -329,6 +404,9 @@ impl<S: Read + Write> Client<S> {
         &mut self,
         update_started: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<Event> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(event);
+        }
         let ctx = self.ctx;
         Ok(match self.conn.parse(|b| ServerMessage::parse(b, &ctx))? {
             ServerMessage::FramebufferUpdate { num_rects } => {
@@ -352,6 +430,7 @@ impl<S: Read + Write> Client<S> {
 
     fn read_update(&mut self, num_rects: u16) -> Result<Event> {
         let mut changed = Vec::new();
+        let mut events = Vec::new();
         for _ in 0..num_rects {
             let header = self.conn.parse(RectHeader::parse)?;
             match header.encoding {
@@ -373,26 +452,101 @@ impl<S: Read + Write> Client<S> {
                     copyrect::decode(&mut self.fb, header.rect, src)?;
                     changed.push(header.rect);
                 }
-                // Cursor shapes are read and discarded until the viewer can
-                // show them (M5). Requesting them keeps the server from
-                // drawing the cursor into the framebuffer.
                 ENCODING_RICH_CURSOR | ENCODING_X_CURSOR => {
-                    let r = header.rect;
-                    let mask = usize::from(r.w).div_ceil(8) * usize::from(r.h);
-                    let len = match header.encoding {
-                        ENCODING_RICH_CURSOR => {
-                            r.area() as usize * self.fb.bytes_per_pixel() + mask
-                        }
-                        _ if r.area() == 0 => 0,
-                        _ => 6 + 2 * mask,
-                    };
-                    self.conn.ensure(len)?;
-                    self.conn.buf.drain(..len);
+                    events.push(Event::Cursor(self.read_cursor(header)?));
                 }
+                ENCODING_POINTER_POS => events.push(Event::PointerPos {
+                    x: header.rect.x,
+                    y: header.rect.y,
+                }),
+                ENCODING_NEW_FB_SIZE => {
+                    // Servers send it with ExtendedDesktopSize too; only a
+                    // new size matters.
+                    let (width, height) = (header.rect.w, header.rect.h);
+                    if (width, height) != (self.fb.width(), self.fb.height()) {
+                        self.fb = Framebuffer::new(width, height, *self.fb.format());
+                        events.push(Event::DesktopSize { width, height });
+                    }
+                }
+                ENCODING_EXTENDED_DESKTOP_SIZE => {
+                    let [count, ..] = self.conn.read_array::<4>()?;
+                    let data = self.conn.read_vec(usize::from(count) * 16)?;
+                    let screens = data
+                        .as_chunks::<16>()
+                        .0
+                        .iter()
+                        .map(|s| {
+                            let mut r = rfb_proto::wire::Reader::new(s);
+                            Screen::read(&mut r).expect("16 bytes")
+                        })
+                        .collect();
+                    let r = header.rect;
+                    let (reason, result) = (r.x, r.y);
+                    // A failed request leaves the framebuffer as it is.
+                    let failed = reason == EDS_REASON_CLIENT && result != EDS_RESULT_SUCCESS;
+                    if !failed && (r.w, r.h) != (self.fb.width(), self.fb.height()) {
+                        self.fb = Framebuffer::new(r.w, r.h, *self.fb.format());
+                        events.push(Event::DesktopSize {
+                            width: r.w,
+                            height: r.h,
+                        });
+                    }
+                    events.push(Event::ExtendedDesktopSize {
+                        reason,
+                        result,
+                        width: r.w,
+                        height: r.h,
+                        screens,
+                    });
+                }
+                ENCODING_QEMU_EXTENDED_KEY_EVENT => events.push(Event::QemuKeyEvents),
+                ENCODING_QEMU_LED_STATE => {
+                    let [state] = self.conn.read_array()?;
+                    events.push(Event::LedState(state.into()));
+                }
+                ENCODING_VMWARE_LED_STATE => {
+                    let state = self.conn.read_array()?;
+                    events.push(Event::LedState(u32::from_be_bytes(state)));
+                }
+                ENCODING_EXTENDED_MOUSE_BUTTONS => events.push(Event::ExtendedMouseButtons),
                 ENCODING_LAST_RECT => break,
                 e => return Err(ClientError::UnsupportedEncoding(e)),
             }
         }
-        Ok(Event::FramebufferUpdate(changed))
+        self.pending.extend(events);
+        self.pending.push_back(Event::FramebufferUpdate(changed));
+        Ok(self.pending.pop_front().expect("just pushed"))
+    }
+
+    /// Reads a RichCursor or XCursor payload.
+    fn read_cursor(&mut self, header: RectHeader) -> Result<CursorShape> {
+        let r = header.rect;
+        if r.area() == 0 {
+            return Ok(CursorShape::default());
+        }
+        let mask_len = usize::from(r.w).div_ceil(8) * usize::from(r.h);
+        Ok(if header.encoding == ENCODING_RICH_CURSOR {
+            let bpp = self.fb.bytes_per_pixel();
+            let pixels = self.conn.read_vec(r.area() as usize * bpp)?;
+            let mask = self.conn.read_vec(mask_len)?;
+            let format = *self.fb.format();
+            cursor_shape(r, &mask, |i| {
+                let p = read_pixel(&pixels[i * bpp..(i + 1) * bpp], format.big_endian);
+                unpack_rgb(&format, p)
+            })
+        } else {
+            let [fr, fg, fb, br, bg, bb] = self.conn.read_array()?;
+            let bitmap = self.conn.read_vec(mask_len)?;
+            let mask = self.conn.read_vec(mask_len)?;
+            let row_bytes = usize::from(r.w).div_ceil(8);
+            cursor_shape(r, &mask, |i| {
+                let (x, y) = (i % usize::from(r.w), i / usize::from(r.w));
+                if bitmap[y * row_bytes + x / 8] & (0x80 >> (x % 8)) != 0 {
+                    [fr, fg, fb]
+                } else {
+                    [br, bg, bb]
+                }
+            })
+        })
     }
 }
