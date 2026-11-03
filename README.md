@@ -85,7 +85,11 @@ cargo build --release --workspace --features rfb-codec/turbojpeg   # libjpeg-tur
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
 echo secret12 | minivnc-passwd -f > passwd
 
-# Linux: Xvfb + xfce4 세션을 공유, 포트 5901
+# Linux: Xvfb + xfce4 세션을 한 번에 띄우는 스크립트 (포트 5901, 최대 5120x1440).
+# TurboVNC vncserver처럼 로그오프하거나 Ctrl+C를 누르면 세션 전체가 끝난다.
+scripts/start-minivnc-server.sh -n 1 -g 5120x1440 -p ~/.vnc/passwd
+
+# 같은 일을 손으로 할 때 (포트 5901)
 # (WSLg에서는 GTK 앱이 Wayland로 가지 않도록 WAYLAND_DISPLAY를 지운다.
 #  Xvfb는 시작 크기보다 커질 수 없으므로, 뷰어 창에 맞춰 크기를 바꾸려면
 #  크게 시작한다)
