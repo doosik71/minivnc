@@ -12,6 +12,11 @@
 #   -p FILE    VNC password file (minivnc-passwd)               default: ~/.vnc/passwd
 #   -- ...     further minivnc-server options, e.g. -- -localhost -viewonly
 #
+# As TurboVNC's vncserver, ~/.vnc/x509_cert.pem and ~/.vnc/x509_private.pem,
+# if they exist, enable the X509 security types. A self-signed pair:
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=$(hostname)" \
+#       -keyout ~/.vnc/x509_private.pem -out ~/.vnc/x509_cert.pem
+#
 # Environment:
 #   MINIVNC_SERVER   minivnc-server binary (default: on PATH, then this
 #                    repository's target/release)
@@ -28,7 +33,7 @@ while getopts "n:g:p:h" opt; do
         n) display=${OPTARG#:} ;;
         g) geometry=$OPTARG ;;
         p) passwd=$OPTARG ;;
-        *) sed -n '2,21s/^# \{0,1\}//p' "$0"; exit 2 ;;
+        *) sed -n '2,26s/^# \{0,1\}//p' "$0"; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -46,6 +51,10 @@ if [ ! -r "$passwd" ]; then
     [ "$passwd" = "$HOME/.vnc/passwd" ] && hint="minivnc-passwd" \
         || hint="mkdir -p $(dirname "$passwd") && minivnc-passwd $passwd"
     fail "no password file $passwd (create one: $hint)"
+fi
+x509=()
+if [ -r "$HOME/.vnc/x509_cert.pem" ] && [ -r "$HOME/.vnc/x509_private.pem" ]; then
+    x509=(-x509cert "$HOME/.vnc/x509_cert.pem" -x509key "$HOME/.vnc/x509_private.pem")
 fi
 command -v Xvfb >/dev/null || fail "Xvfb is not installed"
 [ -e "/tmp/.X$display-lock" ] && fail "display :$display is in use (/tmp/.X$display-lock)"
@@ -78,7 +87,7 @@ desktop_pid=$!
 
 echo "session :$display: desktop up to $geometry, VNC port $((5900 + display)); logs in $log_dir"
 # In the background, so a signal to this script runs the cleanup at once.
-"$server" ":$display" -display ":$display" -rfbauth "$passwd" "$@" \
+"$server" ":$display" -display ":$display" -rfbauth "$passwd" "${x509[@]}" "$@" \
     > >(tee "$log_dir/server-$display.log") 2>&1 &
 server_pid=$!
 

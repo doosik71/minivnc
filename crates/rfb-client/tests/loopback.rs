@@ -6,14 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rfb_auth::{Password, Passwords};
-use rfb_client::{Client, ClientError, ConnectOptions, Event};
+use rfb_client::{Client, ClientError, ConnectOptions, Event, Stream};
 use rfb_codec::{Framebuffer, pack_rgb};
 use rfb_proto::consts::*;
 use rfb_proto::msg::ClientMessage;
 use rfb_proto::{PixelFormat, Rect};
 use rfb_region::Region;
 use rfb_server::source::{Changes, RGB888, SyntheticSource};
-use rfb_server::{Config, FrameSource, InputSink, Server, Sharing};
+use rfb_server::{Config, FrameSource, InputSink, SecurityType, Server, Sharing};
 
 const W: u16 = 200;
 const H: u16 = 120;
@@ -72,7 +72,7 @@ fn passwords() -> Passwords {
     }
 }
 
-fn start(source: impl FrameSource, security_types: Vec<u8>) -> SocketAddr {
+fn start(source: impl FrameSource, security_types: Vec<SecurityType>) -> SocketAddr {
     let config = Config {
         desktop_name: "loopback".into(),
         security_types,
@@ -100,7 +100,7 @@ fn start_with(
     rx.recv().unwrap()
 }
 
-fn connect(addr: SocketAddr, password: Option<&[u8]>) -> Result<Client<TcpStream>, ClientError> {
+fn connect(addr: SocketAddr, password: Option<&[u8]>) -> Result<Client<Stream>, ClientError> {
     connect_opts(addr, password, true)
 }
 
@@ -108,7 +108,7 @@ fn connect_opts(
     addr: SocketAddr,
     password: Option<&[u8]>,
     shared: bool,
-) -> Result<Client<TcpStream>, ClientError> {
+) -> Result<Client<Stream>, ClientError> {
     let stream = TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -118,7 +118,7 @@ fn connect_opts(
         shared,
         ..Default::default()
     };
-    Client::connect(stream, &options)
+    Client::connect(Stream::new(stream), &options)
 }
 
 /// Records injected input.
@@ -162,25 +162,25 @@ impl Recorder {
 
 fn no_auth(config: Config) -> Config {
     Config {
-        security_types: vec![SEC_TYPE_NONE],
+        security_types: vec![SecurityType::None],
         ..config
     }
 }
 
-fn key(client: &mut Client<TcpStream>, keysym: u32, down: bool) {
+fn key(client: &mut Client<Stream>, keysym: u32, down: bool) {
     client
         .send(&ClientMessage::KeyEvent { down, keysym })
         .unwrap();
 }
 
-fn pointer(client: &mut Client<TcpStream>, x: u16, y: u16, buttons: u16) {
+fn pointer(client: &mut Client<Stream>, x: u16, y: u16, buttons: u16) {
     client
         .send(&ClientMessage::PointerEvent { buttons, x, y })
         .unwrap();
 }
 
 /// The server closes the connection: the next read fails.
-fn assert_closed(client: &mut Client<TcpStream>) {
+fn assert_closed(client: &mut Client<Stream>) {
     match client.read_message() {
         Err(ClientError::Io(e)) => assert!(
             matches!(
@@ -242,7 +242,7 @@ fn pointer_lock_follows_dragging_client() {
     );
     let mut a = connect(addr, None).unwrap();
     let mut b = connect(addr, None).unwrap();
-    let sync = |c: &mut Client<TcpStream>| {
+    let sync = |c: &mut Client<Stream>| {
         c.request_update(false, Rect::new(0, 0, 1, 1)).unwrap();
         next_update(c);
     };
@@ -326,7 +326,7 @@ fn updates_wait_for_the_defer_time() {
     assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
 }
 
-fn next_update(client: &mut Client<TcpStream>) -> Vec<Rect> {
+fn next_update(client: &mut Client<Stream>) -> Vec<Rect> {
     loop {
         if let Event::FramebufferUpdate(rects) = client.read_message().unwrap() {
             return rects;
@@ -336,7 +336,7 @@ fn next_update(client: &mut Client<TcpStream>) -> Vec<Rect> {
 
 #[test]
 fn full_update_matches_screen_in_each_pixel_format() {
-    let addr = start(Pattern, vec![SEC_TYPE_VNC_AUTH]);
+    let addr = start(Pattern, vec![SecurityType::Vnc]);
     let rgb565_be = PixelFormat {
         bpp: 16,
         depth: 16,
@@ -436,7 +436,7 @@ fn jpeg_preset(cl: i32, quality: i32, subsamp: i32) -> Vec<i32> {
 
 #[test]
 fn tight_jpeg_presets_are_close() {
-    let addr = start(Pattern, vec![SEC_TYPE_NONE]);
+    let addr = start(Pattern, vec![SecurityType::None]);
     // Perceptually lossless, Medium, Low, and grayscale (subsampling level
     // 1 = 4X, 2 = 2X, 3 = Gray).
     for (preset, limit) in [
@@ -467,7 +467,7 @@ fn tight_jpeg_presets_are_close() {
 fn tight_streams_survive_many_updates() {
     // The moving square produces a new small update every 100 ms; zlib
     // streams carry state across all of them.
-    let addr = start(SyntheticSource::new(320, 200), vec![SEC_TYPE_NONE]);
+    let addr = start(SyntheticSource::new(320, 200), vec![SecurityType::None]);
     let mut client = connect(addr, None).unwrap();
     client
         .set_encodings(&[
@@ -490,19 +490,22 @@ fn tight_streams_survive_many_updates() {
 
 #[test]
 fn wrong_password_is_rejected_with_reason() {
-    let addr = start(Pattern, vec![SEC_TYPE_VNC_AUTH]);
+    let addr = start(Pattern, vec![SecurityType::Vnc]);
     match connect(addr, Some(b"wrong")) {
         Err(ClientError::AuthFailed(Some(reason))) => assert_eq!(reason, "Authentication failed"),
         other => panic!("unexpected {:?}", other.map(|_| ())),
     }
-    assert!(
-        matches!(connect(addr, None), Err(ClientError::NoSecurityType(t)) if t == [SEC_TYPE_VNC_AUTH])
-    );
+    // Like the TurboVNC viewer, the client takes the Tight security type,
+    // whose only capability (VNC authentication) it cannot use.
+    assert!(matches!(
+        connect(addr, None),
+        Err(ClientError::NoMatchingSecurity(_))
+    ));
 }
 
 #[test]
 fn old_protocol_versions_follow_turbovnc() {
-    let addr = start(Pattern, vec![SEC_TYPE_NONE]);
+    let addr = start(Pattern, vec![SecurityType::None]);
     let exchange = |version: &[u8; 12], reply: &[u8], expect: &[u8]| {
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -521,15 +524,16 @@ fn old_protocol_versions_follow_turbovnc() {
     };
     // 3.3: the server picks the type (u32); no SecurityResult for None.
     exchange(b"RFB 003.003\n", &[1], &[0, 0, 0, 1]);
-    // 3.7: type list, client choice, still no SecurityResult for None.
-    exchange(b"RFB 003.007\n", &[1, 1], &[1, 1]);
+    // 3.7: type list (with Tight, as TurboVNC always offers it), client
+    // choice, still no SecurityResult for None.
+    exchange(b"RFB 003.007\n", &[1, 1], &[2, 1, 16]);
     // Non-standard 3.5 is treated as 3.3.
     exchange(b"RFB 003.005\n", &[1], &[0, 0, 0, 1]);
 }
 
 #[test]
 fn incremental_updates_follow_damage() {
-    let addr = start(SyntheticSource::new(320, 200), vec![SEC_TYPE_NONE]);
+    let addr = start(SyntheticSource::new(320, 200), vec![SecurityType::None]);
     let mut client = connect(addr, None).unwrap();
     let all = Rect::new(0, 0, 320, 200);
     client.request_update(false, all).unwrap();
@@ -595,7 +599,7 @@ impl FrameSource for Scripted {
 }
 
 /// Reads events until `pick` accepts one, answering fence requests.
-fn wait_event<T>(client: &mut Client<TcpStream>, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
+fn wait_event<T>(client: &mut Client<Stream>, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
     loop {
         let event = client.read_message().unwrap();
         if let Event::Fence { flags, payload } = &event
@@ -771,7 +775,7 @@ fn desktop_resize() {
         (EDS_REASON_SERVER, 0, W, H, 1)
     );
 
-    let set_size = |client: &mut Client<TcpStream>, width, height| {
+    let set_size = |client: &mut Client<Stream>, width, height| {
         let screens = vec![rfb_proto::msg::Screen {
             id: 0,
             x: 0,
@@ -1005,4 +1009,228 @@ fn clipboard_both_ways_and_bell() {
         rec.0.wait_for(3)[1..],
         ["clipboard \"café\"", "clipboard \"line1\\nline2\""]
     );
+}
+
+fn connect_with(addr: SocketAddr, options: &ConnectOptions) -> Result<Client<Stream>, ClientError> {
+    let stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    Client::connect(Stream::new(stream), options)
+}
+
+/// Accepts `alice` with password `pw`, as PAM would.
+struct FakePam;
+
+impl rfb_server::UserAuth for FakePam {
+    fn authenticate(&self, user: &str, password: &str, _host: &str) -> Result<(), String> {
+        match (user, password) {
+            ("alice" | "bob", "pw") => Ok(()),
+            _ => Err("Authentication failed".into()),
+        }
+    }
+}
+
+fn login_config(acl: Option<Vec<(String, bool)>>) -> Config {
+    Config {
+        security_types: vec![
+            SecurityType::Vnc,
+            SecurityType::UnixLogin,
+            SecurityType::Plain,
+        ],
+        passwords: Some(passwords()),
+        unix_login: Some(rfb_server::UnixLogin {
+            auth: Arc::new(FakePam),
+            owner: "alice".into(),
+            acl,
+        }),
+        ..Config::default()
+    }
+}
+
+fn login(types: &[SecurityType], user: &str, password: &str) -> ConnectOptions {
+    ConnectOptions {
+        security_types: types.to_vec(),
+        user: Some(user.into()),
+        login_password: Some(password.into()),
+        password: Some(Password::new(b"secret")),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn tight_and_vencrypt_logins() {
+    let addr = start_with(Pattern, login_config(None), None);
+    // Through Tight: VNC authentication, Unix Login, and VeNCrypt Plain.
+    for types in [
+        &[SecurityType::Vnc][..],
+        &[SecurityType::UnixLogin],
+        &[SecurityType::Plain],
+    ] {
+        let client = connect_with(addr, &login(types, "alice", "pw"));
+        assert!(client.is_ok(), "{types:?}: {:?}", client.err());
+    }
+    // Wrong password, and a user who does not own the session.
+    match connect_with(addr, &login(&[SecurityType::UnixLogin], "alice", "bad")) {
+        Err(ClientError::AuthFailed(Some(r))) => assert_eq!(r, "Authentication failed"),
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    }
+    match connect_with(addr, &login(&[SecurityType::Plain], "bob", "pw")) {
+        Err(ClientError::AuthFailed(Some(r))) => assert_eq!(r, "User denied access"),
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    }
+    // The ACL replaces the owner check and can grant view-only access.
+    let acl = Some(vec![("bob".to_string(), true)]);
+    let addr = start_with(Pattern, login_config(acl), None);
+    assert!(connect_with(addr, &login(&[SecurityType::Plain], "bob", "pw")).is_ok());
+    assert!(connect_with(addr, &login(&[SecurityType::Plain], "alice", "pw")).is_err());
+}
+
+#[test]
+fn repeated_failures_block_the_host() {
+    let config = Config {
+        passwords: Some(passwords()),
+        auth_fail_timeout: Duration::from_millis(300),
+        ..Config::default()
+    };
+    let addr = start_with(Pattern, config, None);
+    let reason = |r: Result<Client<Stream>, ClientError>| match r {
+        Err(ClientError::AuthFailed(Some(r)) | ClientError::ConnFailed(r)) => r,
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    };
+    for _ in 0..4 {
+        assert_eq!(
+            reason(connect(addr, Some(b"wrong"))),
+            "Authentication failed"
+        );
+    }
+    assert_eq!(
+        reason(connect(addr, Some(b"wrong"))),
+        "Authentication failed.  Client temporarily blocked"
+    );
+    // Even the right password is refused while blocked.
+    assert_eq!(
+        reason(connect(addr, Some(b"secret"))),
+        "Too many authentication failures.  Client temporarily blocked"
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(connect(addr, Some(b"secret")).is_ok());
+}
+
+#[test]
+fn one_time_password_works_once() {
+    let (source, script) = scripted();
+    let config = Config {
+        security_types: vec![SecurityType::Otp],
+        ..no_auth(Config::default())
+    };
+    let addr = start_with(source, config, None);
+    match connect(addr, Some(b"secret")) {
+        Err(ClientError::AuthFailed(Some(r))) => {
+            assert_eq!(r, "The one-time password has not been set on the server")
+        }
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    }
+    let otp = Passwords {
+        full: Password::new(b"onetime"),
+        view_only: None,
+    };
+    let changes = Changes {
+        otp: Some(Some(otp)),
+        ..Changes::default()
+    };
+    script.send((None, changes)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(connect(addr, Some(b"onetime")).is_ok());
+    assert!(connect(addr, Some(b"onetime")).is_err());
+}
+
+/// A self-signed certificate for `cn` and its key, as PEM.
+fn self_signed(cn: &str) -> (Vec<u8>, Vec<u8>) {
+    use openssl::{asn1, bn, ec, hash, nid, pkey, x509};
+    let group = ec::EcGroup::from_curve_name(nid::Nid::X9_62_PRIME256V1).unwrap();
+    let key = pkey::PKey::from_ec_key(ec::EcKey::generate(&group).unwrap()).unwrap();
+    let mut name = x509::X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", cn).unwrap();
+    let name = name.build();
+    let mut b = x509::X509Builder::new().unwrap();
+    b.set_version(2).unwrap();
+    let serial = bn::BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap();
+    b.set_serial_number(&serial).unwrap();
+    b.set_subject_name(&name).unwrap();
+    b.set_issuer_name(&name).unwrap();
+    b.set_pubkey(&key).unwrap();
+    b.set_not_before(&asn1::Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    b.set_not_after(&asn1::Asn1Time::days_from_now(30).unwrap())
+        .unwrap();
+    b.sign(&key, hash::MessageDigest::sha256()).unwrap();
+    (
+        b.build().to_pem().unwrap(),
+        key.private_key_to_pem_pkcs8().unwrap(),
+    )
+}
+
+fn yes(_: &str) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+#[test]
+fn tls_security_types() {
+    let dir = std::env::temp_dir().join(format!("minivnc-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = self_signed("localhost");
+    std::fs::write(dir.join("cert.pem"), cert).unwrap();
+    std::fs::write(dir.join("key.pem"), key).unwrap();
+    let saved = dir.join("x509_savedcerts.pem");
+    let _ = std::fs::remove_file(&saved);
+
+    let config = Config {
+        security_types: vec![
+            SecurityType::X509Vnc,
+            SecurityType::TlsVnc,
+            SecurityType::TlsNone,
+        ],
+        passwords: Some(passwords()),
+        x509_cert: Some(dir.join("cert.pem")),
+        x509_key: Some(dir.join("key.pem")),
+        ..Config::default()
+    };
+    let addr = start_with(Pattern, config, None);
+    let options = |types: &[SecurityType], host: &str, confirm| ConnectOptions {
+        security_types: types.to_vec(),
+        password: Some(Password::new(b"secret")),
+        host: host.into(),
+        saved_certs: Some(saved.clone()),
+        confirm,
+        ..Default::default()
+    };
+
+    // Anonymous TLS, with updates flowing through it.
+    for types in [&[SecurityType::TlsVnc][..], &[SecurityType::TlsNone]] {
+        let mut client = connect_with(addr, &options(types, "localhost", None)).unwrap();
+        client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+        assert!(!next_update(&mut client).is_empty());
+    }
+
+    // An unknown authority needs the user's consent; the certificate is
+    // then saved and trusted from then on.
+    let x509 = &[SecurityType::X509Vnc][..];
+    match connect_with(addr, &options(x509, "localhost", None)) {
+        Err(ClientError::NotTrusted(_)) => {}
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    }
+    let mut client = connect_with(addr, &options(x509, "localhost", Some(yes))).unwrap();
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    assert!(!next_update(&mut client).is_empty());
+    assert!(saved.exists());
+    assert!(connect_with(addr, &options(x509, "localhost", None)).is_ok());
+
+    // A host name the certificate does not name.
+    std::fs::remove_file(&saved).unwrap();
+    match connect_with(addr, &options(x509, "example.org", None)) {
+        Err(ClientError::NotTrusted(_)) => {}
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use rfb_auth::Passwords;
-use rfb_client::{Client, ConnectOptions, Event};
+use rfb_client::{Client, ConnectOptions, Event, Stream};
 use rfb_proto::consts::*;
 use rfb_proto::{PixelFormat, Rect};
 use rfb_region::Region;
@@ -163,7 +163,7 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
         shared: true,
         ..Default::default()
     };
-    let mut client = Client::connect(stream, &options)?;
+    let mut client = Client::connect(Stream::new(stream), &options)?;
     let (w, h) = (client.framebuffer().width(), client.framebuffer().height());
     let v = client.version();
     eprintln!(

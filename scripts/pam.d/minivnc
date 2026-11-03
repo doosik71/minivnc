@@ -1,0 +1,8 @@
+# PAM service for minivnc-server's Unix Login and Plain security types
+# (pam-service-name in /etc/minivncserver-security.conf picks another).
+# Debian/Ubuntu; install with:
+#   sudo cp scripts/pam.d/minivnc /etc/pam.d/minivnc
+# On Fedora/RHEL, use "auth include password-auth" and
+# "account include password-auth" instead.
+@include common-auth
+@include common-account

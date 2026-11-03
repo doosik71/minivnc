@@ -8,24 +8,29 @@
 mod cursor;
 mod encodings;
 mod flow;
+mod handshake;
+pub mod security;
 mod session;
 pub mod source;
+mod tls;
 
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use rfb_auth::Passwords;
 use rfb_codec::Framebuffer;
-use rfb_proto::consts::{EDS_RESULT_PROHIBITED, LED_UNKNOWN, SEC_TYPE_NONE, SEC_TYPE_VNC_AUTH};
+use rfb_proto::consts::{EDS_RESULT_PROHIBITED, LED_UNKNOWN};
 use rfb_proto::msg::DEFAULT_MAX_CUT_TEXT;
 use rfb_region::Region;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast, oneshot};
 use tracing::{error, info, warn};
 
+pub use security::SecurityType;
 pub use source::{Changes, Cursor, FrameSource};
 
 /// How long the capture thread waits for changes before checking whether
@@ -127,14 +132,55 @@ pub struct Sharing {
     pub disconnect: bool,
 }
 
+/// Checks a user name and password for the Plain security types
+/// (`plain`, `unixlogin`, `tlsplain`, `x509plain`). Called on a blocking
+/// thread.
+pub trait UserAuth: Send + Sync + 'static {
+    /// `host` is the client's address. On failure, the message is shown to
+    /// the client.
+    fn authenticate(&self, user: &str, password: &str, host: &str) -> Result<(), String>;
+}
+
+/// Who may log in with a Plain security type.
+#[derive(Clone)]
+pub struct UnixLogin {
+    pub auth: Arc<dyn UserAuth>,
+    /// The user running the server: the only one allowed without an ACL.
+    pub owner: String,
+    /// TurboVNC `enable-user-acl`: these users (with their view-only flag)
+    /// instead of only the owner.
+    pub acl: Option<Vec<(String, bool)>>,
+}
+
+impl std::fmt::Debug for UnixLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnixLogin")
+            .field("owner", &self.owner)
+            .field("acl", &self.acl)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub desktop_name: String,
-    /// Security types to offer, in order of preference. Only
-    /// `SEC_TYPE_NONE` and `SEC_TYPE_VNC_AUTH` are supported.
-    pub security_types: Vec<u8>,
-    /// Required when `SEC_TYPE_VNC_AUTH` is offered.
+    /// Security types to offer, in order of preference.
+    pub security_types: Vec<SecurityType>,
+    /// The VNC password file, for `vnc` and its TLS variants.
     pub passwords: Option<Passwords>,
+    /// For the Plain security types.
+    pub unix_login: Option<UnixLogin>,
+    /// The PEM certificate (chain) and private key for the X509 security
+    /// types (`-x509cert`, `-x509key`); without a key file, the key is
+    /// read from the certificate file.
+    pub x509_cert: Option<PathBuf>,
+    pub x509_key: Option<PathBuf>,
+    /// OpenSSL cipher list for TLS (TurboVNC `permitted-cipher-suites`).
+    pub tls_ciphers: Option<String>,
+    /// Failed VNC authentications before a host is blocked (0 = never), and
+    /// for how long at first (TurboVNC: 5 and 10 s).
+    pub max_auth_fails: u32,
+    pub auth_fail_timeout: Duration,
     /// How long to collect changes before sending an update
     /// (TurboVNC `-deferupdate`).
     pub defer_update: Duration,
@@ -148,6 +194,9 @@ pub struct Config {
     pub congestion_control: bool,
     /// Let clients resize the desktop (TurboVNC `no-remote-resize` off).
     pub remote_resize: bool,
+    /// Largest size clients may resize the desktop to (TurboVNC
+    /// `max-desktop-size`).
+    pub max_desktop_size: Option<(u16, u16)>,
     /// Clipboard transfer limit in bytes (`-maxclipboard`).
     pub max_clipboard: usize,
     /// Send the desktop clipboard to clients (`-noclipboardsend` off).
@@ -162,14 +211,21 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             desktop_name: "MiniVNC".into(),
-            security_types: vec![SEC_TYPE_VNC_AUTH],
+            security_types: vec![SecurityType::Vnc],
             passwords: None,
+            unix_login: None,
+            x509_cert: None,
+            x509_key: None,
+            tls_ciphers: None,
+            max_auth_fails: 5,
+            auth_fail_timeout: Duration::from_secs(10),
             defer_update: Duration::from_millis(1),
             view_only: false,
             sharing: Sharing::default(),
             pointer_lock_timeout: Duration::from_millis(3000),
             congestion_control: true,
             remote_resize: true,
+            max_desktop_size: None,
             max_clipboard: DEFAULT_MAX_CUT_TEXT,
             clipboard_send: true,
             clipboard_recv: true,
@@ -193,6 +249,8 @@ pub(crate) struct Desktop {
     pub clipboard: Option<Arc<str>>,
     /// Client whose `SetDesktopSize` is being carried out.
     pub resizing: Option<u64>,
+    /// The one-time password, cleared once used (TurboVNC `vncpasswd -o`).
+    pub otp: Option<Passwords>,
 }
 
 /// Connected clients and who owns the pointer.
@@ -218,6 +276,8 @@ pub(crate) struct Shared {
     /// The input sink takes QEMU key codes.
     qemu_keys: bool,
     clients: Mutex<Clients>,
+    blocker: security::Blocker,
+    tls: tls::Contexts,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -344,15 +404,17 @@ impl Server {
         if config.security_types.is_empty() {
             return Err(invalid("no security types configured"));
         }
-        if let Some(t) = config
-            .security_types
-            .iter()
-            .find(|t| ![SEC_TYPE_NONE, SEC_TYPE_VNC_AUTH].contains(t))
-        {
-            return Err(invalid(&format!("unsupported security type {t}")));
+        for &t in &config.security_types {
+            if t.method() == security::Method::Plain && config.unix_login.is_none() {
+                return Err(invalid(&format!(
+                    "security type {t} needs user authentication (PAM)"
+                )));
+            }
         }
-        if config.security_types.contains(&SEC_TYPE_VNC_AUTH) && config.passwords.is_none() {
-            return Err(invalid("VNC authentication needs a password file"));
+        let vnc = |t: &SecurityType| t.method() == security::Method::Vnc && !t.is_otp();
+        if config.security_types.iter().any(vnc) && config.passwords.is_none() {
+            // As TurboVNC, refuse at authentication time, so OTP still works.
+            warn!("no VNC password file: VNC authentication works only with a one-time password");
         }
         rfb_codec::translate::validate(&source.format())
             .map_err(|e| invalid(&format!("frame source: {e}")))?;
@@ -372,6 +434,8 @@ impl Server {
             None => None,
         };
 
+        let tls = tls::Contexts::new(&config)?;
+        let blocker = security::Blocker::new(config.max_auth_fails, config.auth_fail_timeout);
         let shared = Arc::new(Shared {
             config,
             screen: RwLock::new(Screen {
@@ -384,11 +448,14 @@ impl Server {
                 leds: LED_UNKNOWN,
                 clipboard: None,
                 resizing: None,
+                otp: None,
             }),
             updates,
             input,
             qemu_keys,
             clients: Mutex::default(),
+            blocker,
+            tls,
         });
 
         let weak = Arc::downgrade(&shared);
@@ -428,7 +495,7 @@ impl Server {
             }
             let shared = Arc::clone(&self.shared);
             tokio::spawn(async move {
-                session::run(stream, Arc::clone(&shared), id, kick).await;
+                session::run(stream, peer.ip(), Arc::clone(&shared), id, kick).await;
                 shared.remove(id);
             });
         }
@@ -589,6 +656,13 @@ fn apply(source: &mut impl FrameSource, shared: &Shared, changes: Changes) -> io
     if let Some(text) = changes.clipboard {
         shared.desktop().clipboard = Some(text.into());
         notify(Update::Clipboard);
+    }
+    if let Some(otp) = changes.otp {
+        info!(
+            "one-time password {}",
+            if otp.is_some() { "set" } else { "cleared" }
+        );
+        shared.desktop().otp = otp;
     }
     Ok(())
 }

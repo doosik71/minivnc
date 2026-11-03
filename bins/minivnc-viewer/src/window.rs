@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rfb_client::{Client, ClientError, CursorShape};
+use rfb_client::{Client, ClientError, CursorShape, Stream};
 use rfb_proto::consts::{EDS_REASON_CLIENT, LED_CAPS_LOCK, LED_NUM_LOCK, LED_SCROLL_LOCK};
 use rfb_proto::msg::{ClientMessage, Screen as ScreenDesc};
 use softbuffer::Surface;
@@ -26,7 +26,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
-use crate::conn::{self, Notice, Reader, SharedClipboard, SharedScreen, Writer};
+use crate::conn::{self, Notice, SharedClipboard, SharedScreen, Writer};
 use crate::connbar;
 use crate::{Options, keys, platform};
 
@@ -731,7 +731,7 @@ fn describe(e: &ClientError) -> String {
 
 /// Opens the window and runs the session until the window is closed or
 /// the connection ends.
-pub fn run(client: Client<Reader>, writer: Writer, opts: &Options) -> Result<(), Box<dyn Error>> {
+pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(), Box<dyn Error>> {
     let title = client.name().to_string();
     let fb = client.framebuffer();
     let (width, height) = (fb.width(), fb.height());

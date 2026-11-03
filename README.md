@@ -73,13 +73,16 @@ minivnc/
 - 선택: libjpeg-turbo JPEG 백엔드(`--features rfb-codec/turbojpeg`)를 쓰려면 CMake와 NASM이 필요합니다. 기본 JPEG 백엔드는 순수 Rust입니다.
 - Linux X11 서버는 순수 Rust X 프로토콜 구현(x11rb)을 쓰므로 X11 개발 헤더가 필요 없습니다. X 서버에는 MIT-SHM(없으면 느린 GetImage 사용), DAMAGE, XTEST, XKEYBOARD 확장이 있어야 합니다.
 - 뷰어는 winit + softbuffer로 그리며 빌드에 추가 시스템 패키지가 필요 없습니다. Linux에서는 실행할 때 X11(또는 Wayland)과 libxkbcommon 라이브러리를 불러옵니다.
+- TLS(VeNCrypt)는 OpenSSL을 씁니다.
+  - Linux: 시스템 OpenSSL과 서버의 PAM을 씁니다(Debian/Ubuntu: `sudo apt install libssl-dev pkg-config libpam0g-dev`).
+  - Windows: OpenSSL을 소스에서 정적으로 빌드하므로 Perl이 필요합니다. [Strawberry Perl](https://strawberryperl.com)을 설치하고 Git for Windows의 perl보다 앞에 오게 하세요(또는 `OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe`). NASM이 PATH에 있으면 어셈블리 구현을 씁니다. 빌드 경로가 너무 길면 OpenSSL 구성이 "files missing"으로 실패하니, 짧은 경로(예: `--target-dir C:\t`)를 쓰세요. 링크할 때 나오는 `LNK4099`(PDB 없음) 경고는 무시해도 됩니다.
 
 ```sh
 cargo build --release
 cargo build --release --workspace --features rfb-codec/turbojpeg   # libjpeg-turbo 사용
 ```
 
-## 현재 시험해 볼 수 있는 것 (M5)
+## 현재 시험해 볼 수 있는 것 (M6)
 
 ```sh
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
@@ -96,6 +99,15 @@ scripts/start-minivnc-server.sh -n 1 -g 5120x1440 -p ~/.vnc/passwd
 Xvfb :1 -screen 0 3840x2160x24 &
 env -u WAYLAND_DISPLAY DISPLAY=:1 dbus-launch --exit-with-session startxfce4 &
 minivnc-server :1 -display :1 -rfbauth passwd
+# 보안 타입: 기본은 TurboVNC처럼 인증이 있는 것 중 쓸 수 있는 것
+#   (TLSVnc, TLSOtp, TLSPlain, X509*, VNC, OTP, UnixLogin, Plain).
+#   X509*는 인증서가 있어야 한다: -x509cert cert.pem -x509key key.pem
+#   (시작 스크립트는 ~/.vnc/x509_cert.pem, x509_private.pem이 있으면 넘긴다)
+#   Plain/UnixLogin은 PAM 서비스 minivnc를 쓴다:
+#   sudo cp scripts/pam.d/minivnc /etc/pam.d/minivnc
+#   보안 설정 파일: /etc/minivncserver-security.conf (TurboVNC 문법)
+# 일회용 비밀번호(OTP): 서버가 도는 X 디스플레이에 설정하고 출력한다.
+minivnc-passwd -o -display :1      # -v: view-only OTP도, -c: 지우기
 # 그 밖의 옵션: -deferupdate MS, -viewonly, -localhost, -securitytypes none,
 #   -alwaysshared / -nevershared / -disconnect, -pointerlocktimeout MS,
 #   -noflowcontrol, -noremoteresize, -maxclipboard BYTES, -noclipboardsend,
@@ -109,6 +121,10 @@ minivnc-server :2 -rfbauth passwd -source png:shots/
 minivnc-viewer myhost:1
 minivnc-viewer myhost:1 -PasswordFile=passwd -Quality=80 -Subsampling=2X
 minivnc-viewer myhost::5901 -JPEG=0 -CompressLevel=0   # 무손실
+# TLS: 기본 SecurityTypes는 TurboVNC 뷰어와 같다. X509 인증서를 확인할 수
+#   없으면 콘솔에서 묻고, 수락한 인증서는 ~/.vnc/x509_savedcerts.pem에 저장한다.
+minivnc-viewer myhost:1 -SecurityTypes=X509Vnc -X509CA=ca.pem
+minivnc-viewer myhost:1 -User=alice                  # Unix Login / Plain
 # 그 밖의 옵션: -Password=PW, -Encoding=Tight|Raw, -Shared=0, -ViewOnly,
 #   -DesktopSize=Auto|Server (Auto: 창 크기에 맞춰 원격 화면 크기를 바꾼다)
 # 최대화 버튼: 전체 화면. 위쪽 가장자리 가운데에 마우스를 대면

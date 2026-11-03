@@ -2,11 +2,10 @@
 //! pixels to the [`Screen`] the window draws from, and tells the window
 //! about everything else.
 
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rfb_client::{Client, CursorShape, Event};
+use rfb_client::{Client, CursorShape, Event, Stream};
 use rfb_codec::clipboard;
 use rfb_proto::consts::*;
 use rfb_proto::msg::{ClientMessage, CutText, DEFAULT_MAX_CUT_TEXT};
@@ -28,57 +27,21 @@ const RGB888: PixelFormat = PixelFormat {
 const CLIP_CAPS: u32 =
     EXT_CLIP_UTF8 | EXT_CLIP_REQUEST | EXT_CLIP_PEEK | EXT_CLIP_NOTIFY | EXT_CLIP_PROVIDE;
 
-/// The read half of the connection. Writes go through the shared
-/// [`Writer`], so the RFB thread and the window never interleave messages.
-pub struct Reader {
-    stream: TcpStream,
-    writer: Writer,
-}
-
-impl Read for Reader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-impl Write for Reader {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
+/// Sends messages for the window while the RFB thread reads; the
+/// [`Stream`] keeps the two from interleaving messages.
 #[derive(Clone)]
-pub struct Writer(Arc<Mutex<TcpStream>>);
+pub struct Writer(Stream);
 
 impl Writer {
-    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write_all(bytes)
+    pub fn new(stream: Stream) -> Self {
+        Self(stream)
     }
 
     pub fn send(&self, msg: &ClientMessage) -> io::Result<()> {
         let mut out = Vec::new();
         msg.write(&mut out);
-        self.write_all(&out)
+        self.0.clone().write_all(&out)
     }
-}
-
-pub fn split(stream: TcpStream) -> io::Result<(Reader, Writer)> {
-    let writer = Writer(Arc::new(Mutex::new(stream.try_clone()?)));
-    Ok((
-        Reader {
-            stream,
-            writer: writer.clone(),
-        },
-        writer,
-    ))
 }
 
 /// The remote screen as `0x00RRGGBB` pixels.
@@ -186,7 +149,7 @@ pub enum Notice {
 }
 
 /// Copies `rects` of the client framebuffer (in [`RGB888`]) to `screen`.
-fn copy_rects(client: &Client<Reader>, rects: &[Rect], screen: &SharedScreen) {
+fn copy_rects(client: &Client<Stream>, rects: &[Rect], screen: &SharedScreen) {
     let fb = client.framebuffer();
     let mut screen = screen.lock();
     let width = usize::from(screen.width);
@@ -202,14 +165,14 @@ fn copy_rects(client: &Client<Reader>, rects: &[Rect], screen: &SharedScreen) {
     }
 }
 
-fn whole(client: &Client<Reader>) -> Rect {
+fn whole(client: &Client<Stream>) -> Rect {
     let fb = client.framebuffer();
     Rect::new(0, 0, fb.width(), fb.height())
 }
 
 /// Sets up the session, then reads messages until the connection fails.
 pub fn run(
-    mut client: Client<Reader>,
+    mut client: Client<Stream>,
     encodings: &[i32],
     screen: &SharedScreen,
     clip: &SharedClipboard,
@@ -285,7 +248,7 @@ pub fn run(
 
 /// ServerCutText, legacy or extended (TurboVNC `CConn`).
 fn server_clipboard(
-    client: &mut Client<Reader>,
+    client: &mut Client<Stream>,
     clip: &SharedClipboard,
     text: CutText,
 ) -> rfb_client::Result<()> {

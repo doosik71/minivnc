@@ -1,6 +1,7 @@
 //! One client connection: handshake, then the normal message loop.
 
 use std::io;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,6 @@ use rfb_auth::Access;
 use rfb_codec::tight::TightEncoder;
 use rfb_codec::{Translator, clipboard, raw};
 use rfb_proto::consts::*;
-use rfb_proto::handshake::{ClientInit, SecurityOffer, SecurityResult, ServerInit, Version};
 use rfb_proto::msg::{
     ClientMessage, ClientParseCtx, CutText, RectHeader, Screen as ScreenDesc, ServerMessage,
     write_framebuffer_update_header,
@@ -16,7 +16,7 @@ use rfb_proto::msg::{
 use rfb_proto::wire::WriteBe;
 use rfb_proto::{Parsed, ProtoError, Rect};
 use rfb_region::Region;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::sync::broadcast::error::RecvError;
@@ -25,14 +25,12 @@ use tracing::{debug, info, trace};
 use crate::encodings::EncodingPrefs;
 use crate::flow::Congestion;
 use crate::source::{to_region_rect, to_wire_rect};
-use crate::{InputEvent, Shared, Update, cursor};
+use crate::{InputEvent, Shared, Update, cursor, handshake};
 
 /// TurboVNC `rfbCombineRect`: send the bounding box instead of more
 /// rectangles than this.
 const COMBINE_RECT: usize = 100;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-/// TurboVNC truncates desktop names to this length.
-const MAX_DESKTOP_NAME: usize = 128;
 /// Fence payloads larger than this are ignored (TurboVNC).
 const MAX_FENCE_PAYLOAD: usize = 64;
 /// Fence payload types used by the server.
@@ -41,13 +39,19 @@ const FENCE_RTT: u8 = 1;
 /// The only screen of the desktop.
 const SCREEN_ID: u32 = 0;
 
-pub(crate) async fn run(stream: TcpStream, shared: Arc<Shared>, id: u64, kick: Arc<Notify>) {
-    let mut conn = Conn::new(stream);
+pub(crate) async fn run(
+    stream: TcpStream,
+    peer: IpAddr,
+    shared: Arc<Shared>,
+    id: u64,
+    kick: Arc<Notify>,
+) {
+    let mut conn = Conn::new(Box::new(stream));
     let result = async {
-        let (access, wants_shared) =
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut conn, &shared, id))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
+        let handshake = handshake::run(&mut conn, &shared, id, peer);
+        let (access, wants_shared) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
         // As in TurboVNC, the sharing policy is applied after ServerInit.
         if !shared.admit(id, wants_shared) {
             return Ok(());
@@ -64,10 +68,14 @@ pub(crate) async fn run(stream: TcpStream, shared: Arc<Shared>, id: u64, kick: A
     }
 }
 
+/// The connection's byte stream: TCP, or TLS once VeNCrypt sets it up.
+pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
 /// Socket plus bytes received but not yet parsed.
-struct Conn {
-    stream: TcpStream,
-    buf: Vec<u8>,
+pub(crate) struct Conn {
+    pub stream: Box<dyn Stream>,
+    pub buf: Vec<u8>,
     scratch: Vec<u8>,
     /// Bytes written so far (wrapping): the stream position for flow
     /// control.
@@ -79,7 +87,7 @@ fn proto_error(e: ProtoError) -> io::Error {
 }
 
 impl Conn {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: Box<dyn Stream>) -> Self {
         Self {
             stream,
             buf: Vec::new(),
@@ -106,7 +114,7 @@ impl Conn {
         }))
     }
 
-    async fn parse<T>(&mut self, parse: impl Fn(&[u8]) -> Parsed<T>) -> io::Result<T> {
+    pub async fn parse<T>(&mut self, parse: impl Fn(&[u8]) -> Parsed<T>) -> io::Result<T> {
         loop {
             if let Some(v) = self.try_parse(&parse)? {
                 return Ok(v);
@@ -115,7 +123,7 @@ impl Conn {
         }
     }
 
-    async fn read_array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+    pub async fn read_array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
         self.parse(|b| {
             Ok(b.get(..N)
                 .map(|s| (s.try_into().expect("slice of length N"), N)))
@@ -123,8 +131,21 @@ impl Conn {
         .await
     }
 
-    async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub async fn read_u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_be_bytes(self.read_array().await?))
+    }
+
+    pub async fn read_vec(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        while self.buf.len() < n {
+            self.fill().await?;
+        }
+        Ok(self.buf.drain(..n).collect())
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.stream.write_all(bytes).await?;
+        // TLS streams buffer records until flushed.
+        self.stream.flush().await?;
         self.sent = self.sent.wrapping_add(bytes.len() as u32);
         Ok(())
     }
@@ -134,102 +155,6 @@ impl Conn {
         msg.write(&mut out);
         self.write(&out).await
     }
-}
-
-/// Runs version and security negotiation, then the initialisation messages.
-/// Returns the access granted and whether the client asked to share.
-async fn handshake(conn: &mut Conn, shared: &Shared, id: u64) -> io::Result<(Access, bool)> {
-    let config = &shared.config;
-    conn.write(&Version::V3_8.to_bytes()).await?;
-    let asked = conn.parse(Version::parse).await?;
-    let version = asked.server_choice().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported RFB version {}.{}", asked.major, asked.minor),
-        )
-    })?;
-    info!(
-        client = id,
-        "using protocol version {}.{}", version.major, version.minor
-    );
-
-    let mut out = Vec::new();
-    let sec_type = if version >= Version::V3_7 {
-        SecurityOffer::Types(config.security_types.clone()).write(version, &mut out);
-        conn.write(&out).await?;
-        let [chosen] = conn.read_array().await?;
-        if !config.security_types.contains(&chosen) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("client chose unoffered security type {chosen}"),
-            ));
-        }
-        chosen
-    } else {
-        // Both supported types work with 3.3, so the first one is used.
-        let chosen = config.security_types[0];
-        SecurityOffer::Types(vec![chosen]).write(version, &mut out);
-        conn.write(&out).await?;
-        chosen
-    };
-
-    let access = match sec_type {
-        SEC_TYPE_VNC_AUTH => {
-            let passwords = config.passwords.as_ref().expect("checked in Server::start");
-            let challenge = rfb_auth::challenge()?;
-            conn.write(&challenge).await?;
-            let response = conn.read_array().await?;
-            match passwords.check(&challenge, &response) {
-                Some(access) => access,
-                None => {
-                    info!(client = id, "VNC authentication failed");
-                    let mut out = Vec::new();
-                    SecurityResult::Failed {
-                        code: AUTH_FAILED,
-                        reason: (version >= Version::V3_8).then(|| "Authentication failed".into()),
-                    }
-                    .write(&mut out);
-                    conn.write(&out).await?;
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "authentication failed",
-                    ));
-                }
-            }
-        }
-        _ => Access::Full,
-    };
-    // TurboVNC `rfbClientAuthSucceeded`: no result for None before 3.8.
-    if version >= Version::V3_8 || sec_type == SEC_TYPE_VNC_AUTH {
-        let mut out = Vec::new();
-        SecurityResult::Ok.write(&mut out);
-        conn.write(&out).await?;
-    }
-    info!(client = id, ?access, "security type {sec_type} accepted");
-
-    let init = conn.parse(ClientInit::parse).await?;
-    debug!(client = id, shared = init.shared, "client init");
-    let mut name = config.desktop_name.clone();
-    if name.len() > MAX_DESKTOP_NAME {
-        let mut end = MAX_DESKTOP_NAME;
-        while !name.is_char_boundary(end) {
-            end -= 1;
-        }
-        name.truncate(end);
-    }
-    let server_init = {
-        let fb = &shared.screen().plain;
-        ServerInit {
-            width: fb.width(),
-            height: fb.height(),
-            format: *fb.format(),
-            name,
-        }
-    };
-    let mut out = Vec::new();
-    server_init.write(&mut out);
-    conn.write(&out).await?;
-    Ok((access, init.shared))
 }
 
 /// Protocol extensions the client announced in `SetEncodings`.
@@ -762,6 +687,11 @@ impl<'a> Session<'a> {
                 && u32::from(s.y) + u32::from(s.h) <= u32::from(height);
             valid &= inside && !screens[..i].iter().any(|o| o.id == s.id);
         }
+        // TurboVNC `max-desktop-size` clamps rather than refuses.
+        let (width, height) = match self.shared.config.max_desktop_size {
+            Some((w, h)) => (width.min(w), height.min(h)),
+            None => (width, height),
+        };
         let current = self.shared.screen().plain.bounds();
         let result = if self.view_only() {
             EDS_RESULT_PROHIBITED

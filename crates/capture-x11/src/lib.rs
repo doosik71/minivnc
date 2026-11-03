@@ -10,7 +10,7 @@ mod qnum_table;
 mod x11;
 
 #[cfg(target_os = "linux")]
-pub use x11::{X11Input, X11Source, open};
+pub use x11::{X11Input, X11Source, open, set_otp};
 
 #[cfg(test)]
 mod tests {

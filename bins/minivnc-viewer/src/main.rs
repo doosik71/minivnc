@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rfb_auth::{Password, Passwords};
-use rfb_client::{Client, ConnectOptions};
+use rfb_client::{Client, ConnectOptions, SecurityType, Stream};
 use rfb_proto::consts::*;
 
 const USAGE: &str = "\
@@ -26,6 +26,14 @@ usage: minivnc-viewer [options] HOST[:DISPLAY | ::PORT]
   HOST::PORT            connect to PORT
   -Password=PASSWORD    VNC password (otherwise asked for when needed)
   -PasswordFile=FILE    VNC password file (TurboVNC format)
+  -User=NAME            user name for Unix Login / Plain authentication
+  -SecurityTypes=LIST   security types to accept; the server's order picks
+                        among them (default: X509Plain, X509Vnc, X509None,
+                        TLSPlain, TLSVnc, TLSNone, VNC, Plain, UnixLogin,
+                        None)
+  -X509CA=FILE          trusted certificate authorities for the X509 types
+                        (default: ~/.vnc/x509_ca.pem); certificates accepted
+                        at the prompt go to ~/.vnc/x509_savedcerts.pem
   -Encoding=ENC         Tight (default) or Raw
   -JPEG=0|1             allow JPEG compression with Tight (default 1)
   -Quality=Q            JPEG quality 1-100 (default 95)
@@ -49,6 +57,10 @@ struct Options {
     port: u16,
     password: Option<String>,
     password_file: Option<PathBuf>,
+    user: Option<String>,
+    /// Empty: the TurboVNC viewer's defaults.
+    security_types: Vec<SecurityType>,
+    x509_ca: Option<PathBuf>,
     /// `ENCODING_TIGHT` or `ENCODING_RAW`.
     encoding: i32,
     jpeg: bool,
@@ -70,6 +82,9 @@ impl Default for Options {
             port: 5900,
             password: None,
             password_file: None,
+            user: None,
+            security_types: Vec::new(),
+            x509_ca: None,
             encoding: ENCODING_TIGHT,
             jpeg: true,
             quality: 95,
@@ -191,6 +206,19 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         match key.as_str() {
             "password" => opts.password = Some(value),
             "passwordfile" => opts.password_file = Some(value.into()),
+            "user" => opts.user = Some(value),
+            "securitytypes" => {
+                let types = rfb_proto::security::parse_security_types(&value)?;
+                // One-time passwords are VNC passwords to the viewer.
+                if let Some(t) = types.iter().find(|t| t.is_otp()) {
+                    return Err(format!("{t} is a server-side security type; use VNC"));
+                }
+                if types.is_empty() {
+                    return Err(format!("{name} is empty"));
+                }
+                opts.security_types = types;
+            }
+            "x509ca" => opts.x509_ca = Some(value.into()),
             "encoding" => {
                 opts.encoding = match value.to_ascii_lowercase().as_str() {
                     "tight" => ENCODING_TIGHT,
@@ -227,6 +255,38 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
     Ok(opts)
 }
 
+/// Unix Login / Plain credentials, asked on the console.
+fn ask_login(user: Option<&str>) -> std::io::Result<(String, String)> {
+    let user = match user {
+        Some(u) => u.to_string(),
+        None => {
+            eprint!("User: ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line.trim().to_string()
+        }
+    };
+    let password = rpassword::prompt_password(format!("Password for {user}: "))?;
+    Ok((user, password))
+}
+
+/// Asks on the console about a certificate problem.
+fn confirm(question: &str) -> std::io::Result<bool> {
+    eprint!("{question} [y/N] ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// `~/.vnc`, where the TurboVNC viewer keeps its files.
+fn vnc_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".vnc"))
+}
+
 fn ask_password() -> std::io::Result<Password> {
     let p = rpassword::prompt_password("Password: ")?;
     Ok(Password::new(p.as_bytes()))
@@ -240,13 +300,26 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
     };
     let stream = TcpStream::connect((opts.host.as_str(), opts.port))?;
     stream.set_nodelay(true)?;
-    let (reader, writer) = conn::split(stream)?;
+    let stream = Stream::new(stream);
+    let writer = conn::Writer::new(stream.clone());
+    let vnc_dir = vnc_dir();
     let options = ConnectOptions {
         password,
         ask_password: Some(ask_password),
+        security_types: opts.security_types.clone(),
+        user: opts.user.clone(),
+        login_password: None,
+        ask_login: Some(ask_login),
+        host: opts.host.clone(),
+        x509_ca: opts
+            .x509_ca
+            .clone()
+            .or_else(|| vnc_dir.as_ref().map(|d| d.join("x509_ca.pem"))),
+        saved_certs: vnc_dir.map(|d| d.join("x509_savedcerts.pem")),
+        confirm: Some(confirm),
         shared: opts.shared,
     };
-    let client = Client::connect(reader, &options)?;
+    let client = Client::connect(stream, &options)?;
     let v = client.version();
     tracing::info!(
         "connected to {}:{}: RFB {}.{}, \"{}\", {}x{}",

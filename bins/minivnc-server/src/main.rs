@@ -7,14 +7,25 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+mod pam;
+mod secconf;
+
 use rfb_auth::Passwords;
-use rfb_proto::consts::{SEC_TYPE_NONE, SEC_TYPE_VNC_AUTH};
+use rfb_server::security::parse_security_types;
 use rfb_server::source::{PngSource, SyntheticSource};
-use rfb_server::{Config, Server, Sharing};
+use rfb_server::{Config, SecurityType, Server, Sharing};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::secconf::SecurityConfig;
+
+/// User name and password authentication needs PAM.
+const PAM: bool = cfg!(target_os = "linux");
 
 const USAGE: &str = "\
 usage: minivnc-server [:N] [options]
@@ -23,8 +34,15 @@ usage: minivnc-server [:N] [options]
   -rfbport PORT         listen on PORT instead
   -localhost            accept connections from this host only
   -rfbauth FILE         VNC password file (see minivnc-passwd)
-  -securitytypes LIST   comma-separated, in order of preference:
-                        VNC, None (default: VNC)
+  -securitytypes LIST   comma-separated security types to enable, as in
+                        TurboVNC: None, VNC, OTP, Plain, UnixLogin, TLSNone,
+                        TLSVnc, TLSOtp, TLSPlain, X509None, X509Vnc, X509Otp,
+                        X509Plain (default: those with authentication that
+                        this build and the options allow)
+  -x509cert FILE        X.509 certificate (PEM) for the X509* types
+  -x509key FILE         its private key (default: in the certificate file)
+  -securityconf FILE    security configuration file
+                        (default: /etc/minivncserver-security.conf)
   -desktop NAME         desktop name (default: MiniVNC)
   -display DISPLAY      X display to share (default: $DISPLAY; Linux only)
   -source SOURCE        x11          the X display (default on Linux)
@@ -62,7 +80,11 @@ struct Options {
     port: u16,
     localhost: bool,
     rfbauth: Option<PathBuf>,
-    security_types: Vec<u8>,
+    /// `-securitytypes`; `None` means the defaults.
+    security_types: Option<Vec<SecurityType>>,
+    x509cert: Option<PathBuf>,
+    x509key: Option<PathBuf>,
+    security_conf: PathBuf,
     desktop: String,
     source: Source,
     geometry: (u16, u16),
@@ -90,7 +112,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         port: 5900,
         localhost: false,
         rfbauth: None,
-        security_types: vec![SEC_TYPE_VNC_AUTH],
+        security_types: None,
+        x509cert: None,
+        x509key: None,
+        security_conf: secconf::DEFAULT_PATH.into(),
         desktop: "MiniVNC".into(),
         source: if cfg!(target_os = "linux") {
             Source::X11(None)
@@ -124,7 +149,16 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
             "rfbport" => rfbport = Some(value(&arg)?.parse().map_err(|_| "bad -rfbport")?),
             "localhost" => opts.localhost = true,
             "rfbauth" => opts.rfbauth = Some(value(&arg)?.into()),
-            "securitytypes" => opts.security_types = parse_security_types(&value(&arg)?)?,
+            "securitytypes" => {
+                let types = parse_security_types(&value(&arg)?)?;
+                if types.is_empty() {
+                    return Err("-securitytypes is empty".into());
+                }
+                opts.security_types = Some(types);
+            }
+            "x509cert" => opts.x509cert = Some(value(&arg)?.into()),
+            "x509key" => opts.x509key = Some(value(&arg)?.into()),
+            "securityconf" => opts.security_conf = value(&arg)?.into(),
             "desktop" => opts.desktop = value(&arg)?,
             "source" => {
                 let v = value(&arg)?;
@@ -173,24 +207,54 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
     Ok(opts)
 }
 
-fn parse_security_types(list: &str) -> Result<Vec<u8>, String> {
-    let mut types = Vec::new();
-    for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let t = match name.to_ascii_lowercase().as_str() {
-            "vnc" => SEC_TYPE_VNC_AUTH,
-            "none" => SEC_TYPE_NONE,
-            _ => {
-                return Err(format!(
-                    "unsupported security type {name} (supported: VNC, None)"
-                ));
+/// Why a security type cannot be used in this server, if it cannot.
+fn unavailable(t: SecurityType, opts: &Options, pam: bool) -> Option<&'static str> {
+    let name = t.name();
+    if (name.ends_with("plain") || t == SecurityType::UnixLogin) && !pam {
+        return Some("it needs PAM (Linux only)");
+    }
+    if name.starts_with("x509") && opts.x509cert.is_none() {
+        return Some("it needs -x509cert");
+    }
+    None
+}
+
+/// The security types to offer, as TurboVNC `rfbAuthInit` decides: those
+/// enabled (by `-securitytypes`, or by default) and permitted by the
+/// security configuration, in its order of preference or else TurboVNC's.
+/// By default, types this build or the options cannot provide are left out.
+fn security_types(
+    opts: &Options,
+    conf: &SecurityConfig,
+    pam: bool,
+) -> Result<Vec<SecurityType>, String> {
+    let enabled: Vec<SecurityType> = match &opts.security_types {
+        Some(list) => {
+            for &t in list {
+                if let Some(why) = unavailable(t, opts, pam) {
+                    return Err(format!("security type {t} is not available: {why}"));
+                }
             }
-        };
-        if !types.contains(&t) {
-            types.push(t);
+            list.clone()
+        }
+        None => SecurityType::ALL
+            .into_iter()
+            .filter(|&t| t.enabled_by_default() && unavailable(t, opts, pam).is_none())
+            .collect(),
+    };
+    let order = conf.permitted.as_deref().unwrap_or(&SecurityType::ALL);
+    for t in &enabled {
+        if !order.contains(t) {
+            warn!("security type '{t}' is not permitted");
         }
     }
+    let types: Vec<SecurityType> = order
+        .iter()
+        .copied()
+        .filter(|t| enabled.contains(t))
+        .collect();
     if types.is_empty() {
-        return Err("-securitytypes is empty".into());
+        return Err("no security types enabled".into());
     }
     Ok(types)
 }
@@ -223,28 +287,33 @@ async fn main() -> ExitCode {
 }
 
 async fn run(opts: Options) -> std::io::Result<()> {
+    let conf = SecurityConfig::load(&opts.security_conf).map_err(std::io::Error::other)?;
+    let security_types = security_types(&opts, &conf, PAM).map_err(std::io::Error::other)?;
+    let names: Vec<&str> = security_types.iter().map(|t| t.name()).collect();
+    info!("security types: {}", names.join(", "));
     let passwords = match &opts.rfbauth {
         Some(path) => Some(Passwords::read_file(path)?),
-        None if opts.security_types.contains(&SEC_TYPE_VNC_AUTH) => {
-            return Err(std::io::Error::other(
-                "VNC authentication needs -rfbauth FILE (or use -securitytypes None)",
-            ));
-        }
         None => None,
     };
     let config = Config {
         desktop_name: opts.desktop,
-        security_types: opts.security_types,
+        security_types,
         passwords,
+        unix_login: unix_login(&conf)?,
+        x509_cert: opts.x509cert,
+        x509_key: opts.x509key,
+        tls_ciphers: conf.permitted_cipher_suites.clone(),
         defer_update: opts.defer_update,
         view_only: opts.view_only,
         sharing: opts.sharing,
         pointer_lock_timeout: opts.pointer_lock_timeout,
         congestion_control: opts.congestion_control,
-        remote_resize: opts.remote_resize,
+        remote_resize: opts.remote_resize && !conf.no_remote_resize,
+        max_desktop_size: conf.max_desktop_size,
         max_clipboard: opts.max_clipboard,
-        clipboard_send: opts.clipboard_send,
-        clipboard_recv: opts.clipboard_recv,
+        clipboard_send: opts.clipboard_send && !conf.no_clipboard_send,
+        clipboard_recv: opts.clipboard_recv && !conf.no_clipboard_recv,
+        ..Config::default()
     };
     let server = match opts.source {
         Source::Pattern => Server::start(
@@ -260,7 +329,7 @@ async fn run(opts: Options) -> std::io::Result<()> {
         Source::X11(display) => start_x11(config, display.as_deref(), opts.primary_sync)?,
     };
 
-    let ip = if opts.localhost {
+    let ip = if opts.localhost || conf.no_remote_connections {
         Ipv4Addr::LOCALHOST
     } else {
         Ipv4Addr::UNSPECIFIED
@@ -268,6 +337,29 @@ async fn run(opts: Options) -> std::io::Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((ip, opts.port))).await?;
     info!("listening on {}", listener.local_addr()?);
     server.serve(listener).await
+}
+
+/// Who may log in with a user name and password: the session owner, or
+/// with `enable-user-acl` the users of the ACL, which starts with the owner
+/// (TurboVNC adds more with `vncpasswd -a`; MiniVNC does not).
+#[cfg(target_os = "linux")]
+fn unix_login(conf: &SecurityConfig) -> std::io::Result<Option<rfb_server::UnixLogin>> {
+    let owner = pam::current_user()
+        .ok_or_else(|| std::io::Error::other("cannot find the name of the current user"))?;
+    let service = conf
+        .pam_service_name
+        .clone()
+        .unwrap_or_else(|| pam::DEFAULT_SERVICE.into());
+    Ok(Some(rfb_server::UnixLogin {
+        auth: Arc::new(pam::Pam { service }),
+        acl: conf.enable_user_acl.then(|| vec![(owner.clone(), false)]),
+        owner,
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unix_login(_: &SecurityConfig) -> std::io::Result<Option<rfb_server::UnixLogin>> {
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -319,10 +411,51 @@ mod tests {
             "test",
         ])
         .unwrap();
-        assert_eq!(o.security_types, [SEC_TYPE_NONE, SEC_TYPE_VNC_AUTH]);
+        assert_eq!(
+            o.security_types,
+            Some(vec![SecurityType::None, SecurityType::Vnc])
+        );
         assert!(o.localhost);
         assert_eq!(o.desktop, "test");
-        assert!(parse(&["-securitytypes", "TLSVnc"]).is_err());
+        assert!(parse(&["-securitytypes", "Bogus"]).is_err());
+        assert!(parse(&["-securitytypes", ","]).is_err());
+    }
+
+    #[test]
+    fn security_type_selection() {
+        use SecurityType::*;
+        let conf = SecurityConfig::default();
+        // Defaults: those with authentication this build can provide, in
+        // TurboVNC's order.
+        let o = parse(&[]).unwrap();
+        assert_eq!(
+            security_types(&o, &conf, false).unwrap(),
+            [TlsVnc, TlsOtp, Vnc, Otp]
+        );
+        assert_eq!(
+            security_types(&o, &conf, true).unwrap(),
+            [TlsVnc, TlsOtp, TlsPlain, Vnc, Otp, UnixLogin, Plain]
+        );
+        // The X509 types need a certificate.
+        let o = parse(&["-x509cert", "cert.pem"]).unwrap();
+        assert_eq!(
+            security_types(&o, &conf, false).unwrap(),
+            [TlsVnc, TlsOtp, X509Vnc, X509Otp, Vnc, Otp]
+        );
+        let o = parse(&["-securitytypes", "x509vnc"]).unwrap();
+        assert!(security_types(&o, &conf, false).is_err());
+        // Explicit types come in TurboVNC's order, not the command line's.
+        let o = parse(&["-securitytypes", "otp,none"]).unwrap();
+        assert_eq!(security_types(&o, &conf, false).unwrap(), [None, Otp]);
+        assert!(
+            security_types(&parse(&["-securitytypes", "plain"]).unwrap(), &conf, false).is_err()
+        );
+        // The configuration file filters and orders.
+        let conf = SecurityConfig::parse("permitted-security-types=otp,vnc").unwrap();
+        let o = parse(&["-securitytypes", "vnc,otp,none"]).unwrap();
+        assert_eq!(security_types(&o, &conf, false).unwrap(), [Otp, Vnc]);
+        let o = parse(&["-securitytypes", "none"]).unwrap();
+        assert!(security_types(&o, &conf, false).is_err());
     }
 
     #[test]

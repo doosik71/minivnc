@@ -39,3 +39,7 @@ unix/Xvnc/programs/Xserver/hw/vnc/flowcontrol.c:
                                                  All Rights Reserved.
   Copyright (C) 2018 Peter Åstrand for Cendio AB.  All Rights Reserved.
   Copyright (C) 2011, 2015 Pierre Ossman for Cendio AB.  All Rights Reserved.
+
+TLS uses OpenSSL (https://www.openssl.org), licensed under the Apache
+License 2.0: the system library on Linux, statically linked into Windows
+builds.

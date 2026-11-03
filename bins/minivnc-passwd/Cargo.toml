@@ -13,3 +13,6 @@ workspace = true
 [dependencies]
 rfb-auth = { path = "../../crates/rfb-auth" }
 rpassword = "7.5.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+capture-x11 = { path = "../../crates/capture-x11" }

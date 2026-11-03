@@ -18,3 +18,10 @@ rfb-server = { path = "../../crates/rfb-server" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pam = "0.7"
+uzers = "0.12.2"

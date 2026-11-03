@@ -8,6 +8,7 @@ use std::os::fd::AsFd;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rfb_auth::{Password, Passwords};
 use rfb_codec::Framebuffer;
 use rfb_proto::consts::{LED_CAPS_LOCK, LED_NUM_LOCK, LED_SCROLL_LOCK};
 use rfb_proto::{PixelFormat, Rect};
@@ -24,7 +25,7 @@ use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _, CursorNotifyMask};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    ChangeWindowAttributesAux, ConnectionExt as _, EventMask, ImageFormat,
+    AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, ImageFormat, Property,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -47,6 +48,8 @@ pub struct X11Source {
     initial: Changes,
     /// Desktop clipboard text from the clipboard thread.
     clipboard: mpsc::Receiver<String>,
+    /// The root window property `vncpasswd -o` sets.
+    otp_atom: u32,
 }
 
 impl X11Source {
@@ -72,12 +75,15 @@ impl X11Source {
         let damage = conn.generate_id().map_err(xerr)?;
         conn.damage_create(damage, root, ReportLevel::DELTA_RECTANGLES)
             .map_err(xerr)?;
-        // Screen size changes arrive as ConfigureNotify on the root window.
+        // Screen size changes arrive as ConfigureNotify on the root window,
+        // one-time passwords as a change of its VNC_OTP property.
         conn.change_window_attributes(
             root,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE),
         )
         .map_err(xerr)?;
+        let otp_atom = super::otp_atom(&conn)?;
 
         let cursor_ok = conn
             .extension_information(xfixes::X11_EXTENSION_NAME)
@@ -120,6 +126,7 @@ impl X11Source {
             indicators,
             initial: Changes::default(),
             clipboard,
+            otp_atom,
         };
         if cursor_ok {
             source.initial.cursor = source.fetch_cursor()?;
@@ -158,6 +165,23 @@ impl X11Source {
             hot_x: c.xhot,
             hot_y: c.yhot,
             pixels: c.cursor_image,
+        }))
+    }
+
+    /// Reads and deletes the one-time password property: 8 bytes of full
+    /// control password, 8 more for view-only, none to clear it (TurboVNC
+    /// `vncpasswd -o` / `-c`).
+    fn take_otp(&self) -> io::Result<Option<Passwords>> {
+        let value = self
+            .conn
+            .get_property(true, self.display.root, self.otp_atom, AtomEnum::ANY, 0, 4)
+            .map_err(xerr)?
+            .reply()
+            .map_err(xerr)?
+            .value;
+        Ok(value.get(..8).map(|full| Passwords {
+            full: Password::new(full),
+            view_only: value.get(8..16).map(Password::new),
         }))
     }
 
@@ -356,6 +380,11 @@ impl FrameSource for X11Source {
                     }
                     Event::XkbIndicatorStateNotify(e) => changes.leds = Some(self.leds(e.state)),
                     Event::XkbBellNotify(_) => changes.bell = true,
+                    Event::PropertyNotify(e)
+                        if e.atom == self.otp_atom && e.state == Property::NEW_VALUE =>
+                    {
+                        changes.otp = Some(self.take_otp()?);
+                    }
                     other => debug!(?other, "ignoring X event"),
                 }
             }

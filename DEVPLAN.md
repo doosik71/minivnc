@@ -481,7 +481,7 @@ pub trait InputSink {
 | zlib              | 압축: C zlib(`libz-sys` 정적 빌드) 직접 래핑, 해제: `flate2`          | 영구 스트림, `Z_SYNC_FLUSH`, `deflateParams`가 필요하다. flate2의 `set_level`은 이 용도로 동작하지 않는다(M2 참고). |
 | JPEG              | 기본 `jpeg-encoder`/`zune-jpeg`(순수 Rust), feature `turbojpeg`         | 빌드 의존성 없이 동작한다. libjpeg-turbo는 TurboVNC와 같은 출력을 내며, CMake와 NASM이 필요하다.                       |
 | DES               | `des` 크레이트                                                         | VNC 키 비트 반전을 직접 처리해야 한다.                                                                                  |
-| TLS               | `rustls` (X509*) + `openssl` feature (TLSNone/TLSVnc/TLSPlain 익명 DH) | rustls는 익명 DH(aNULL)를 지원하지 않는다. 따라서 익명 TLS는 openssl feature로만 제공한다.                              |
+| TLS               | `openssl` (서버는 `tokio-openssl`), Windows는 `vendored`               | 익명 DH(aNULL)와 X.509를 한 라이브러리로 처리한다. rustls는 aNULL을 지원하지 않는다. Linux는 시스템 libssl을 쓴다.     |
 | X11               | `x11rb` (shm, damage, xfixes, xtest, randr, xkb)                       | 순수 Rust이고 확장을 모두 지원한다.                                                                                     |
 | 창/그리기         | `winit` + `softbuffer` (필요 시 `wgpu`로 스케일링)                     | 가볍고 크로스 플랫폼이다.                                                                                               |
 | 클립보드          | `arboard`                                                              | Windows/X11/macOS를 지원한다.                                                                                           |
@@ -489,7 +489,7 @@ pub trait InputSink {
 | SSH               | 1단계는 외부 `ssh` 실행, 2단계는 `russh`                               | JSch와 같은 기능 범위                                                                                                   |
 | 로깅              | `tracing`                                                              | `-loglevel`에 대응한다.                                                                                                 |
 | CLI               | `clap` + TurboVNC 스타일(`-Name=value`) 호환 파서                      | 기존 스크립트와 호환된다.                                                                                               |
-| PAM               | `pam` 크레이트 (feature)                                               | Linux 전용                                                                                                              |
+| PAM               | `pam` 0.7 크레이트                                                     | Linux 전용. 0.8은 bindgen(libclang)이 필요해 쓰지 않았다.                                                              |
 
 ### 4.6 영역(Region) 연산
 
@@ -669,15 +669,36 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - 루프백 테스트를 추가했다: fence와 CU, 커서 모양과 위치, 데스크톱 크기 변경(성공/거부), QEMU 키·LED·확장 마우스 버튼, 클립보드 양방향과 벨.
 
 ### M6. 보안 (2주)
-- [ ] **Tight 보안 타입**(16): 터널/인증 능력, 상호작용 능력(서버 송신, 클라이언트 수신 후 무시)
-- [ ] **VeNCrypt** 0.2와 서브타입 협상
-  - X509None/X509Vnc/X509Plain (`rustls`, `-x509cert`/`-x509key`)
-  - TLSNone/TLSVnc/TLSPlain (`openssl` feature, 익명 DH)
-  - 뷰어: CA 검증, 미확인 인증서 지문 저장 및 확인 대화상자
-- [ ] Plain/UnixLogin: PAM 인증(Linux, feature), 세션 소유자 검사. UTF-8 길이 버그는 재현하지 않는다.
-- [ ] view-only 비밀번호(16바이트 파일), OTP, 무차별 대입 차단(5회 실패 / 10초, 이후 2배)
-- [ ] 보안 설정 파일(`/etc/turbovncserver-security.conf` 문법 호환 파서, 소유자/권한 검사)
+- [x] **Tight 보안 타입**(16): 터널/인증 능력, 상호작용 능력(서버 송신, 클라이언트 수신 후 무시)
+  - 서버는 TurboVNC처럼 Tight를 항상 제안하고, None은 다른 타입이 없을 때만 제안한다. 뷰어는 Java 뷰어처럼 Tight가 있으면 Tight를 고른 뒤 서버의 첫 사용 가능한 인증 능력을 쓴다.
+  - 상호작용 능력에는 MiniVNC가 실제로 보내는 인코딩만 넣는다(TurboVNC는 Hextile 등도 넣는다). Java 뷰어는 Tight를 고르면 이 목록을 반드시 읽으므로, 빠지면 ServerInit 뒤에 멈춘다.
+  - 보안 타입 표(`rfb-proto/src/security.rs`)는 TurboVNC `auth.c`의 순서와 기본값을 따르며 서버와 뷰어가 함께 쓴다.
+- [x] **VeNCrypt** 0.2와 서브타입 협상 (사용자 결정: 서버와 뷰어 모두 OpenSSL)
+  - X509None/X509Vnc/X509Plain: `-x509cert`/`-x509key`(PEM). 인증서와 키는 서버 시작 때 읽으므로, 잘못되면 TurboVNC와 달리 접속 때가 아니라 시작 때 실패한다. 인증서가 없으면 기본 목록에서 X509 타입을 뺀다.
+  - TLSNone/TLSVnc/TLSPlain: 익명 DH. TLS 1.3에는 익명 암호군이 없으므로 TLS 1.2까지만 쓰고, OpenSSL 보안 수준 0으로 `aNULL`을 허용한다. TurboVNC는 접속마다 DSA로 DH 파라미터를 만들지만, MiniVNC는 고정 2048비트 그룹(RFC 5114)을 쓴다.
+  - `permitted-cipher-suites`는 OpenSSL 암호군 목록으로 그대로 넘긴다. `tls-key-length`는 지원하지 않는다.
+  - 뷰어: TLS로 바뀐 뒤에도 읽기 스레드와 쓰기(창)가 한 연결을 나눠 써야 하므로 `rfb_client::Stream`을 만들었다. 읽을 데이터가 올 때까지 잠금 없이 기다린 뒤 TLS 레코드를 읽어, 쓰기가 읽기를 기다리지 않는다.
+  - 뷰어 인증서 검사(Java `CSecurityTLS` 순서): 유효 기간(만료면 확인), `~/.vnc/x509_savedcerts.pem`에 저장된 인증서면 통과, 호스트 이름(SAN의 DNS/IP, 없으면 CN; 다르면 확인), 시스템 CA와 `-X509CA`(기본 `~/.vnc/x509_ca.pem`). 모르는 발급자면 인증서 정보와 SHA-256 지문을 보여 주고 콘솔에서 묻고, 수락하면 저장한다(Java 뷰어와 같은 파일 형식).
+- [x] Plain/UnixLogin: PAM 인증(Linux), 세션 소유자 검사. UTF-8 길이 버그는 재현하지 않는다.
+  - PAM 서비스 이름은 `minivnc`(사용자 결정, 예제 `scripts/pam.d/minivnc`), `pam-service-name`으로 바꾼다. 실패 메시지는 TurboVNC `authpam.c`와 같다.
+  - `pam` 크레이트는 `PAM_RHOST`를 설정할 수 없어 PAM 모듈이 클라이언트 주소를 모른다. PAM 세션(`-pamsession`)은 지원하지 않는다.
+  - `enable-user-acl`이면 ACL은 세션 소유자(전체 제어)로 시작한다. TurboVNC처럼 `vncpasswd -a`로 사용자를 더하는 기능은 없다.
+- [x] view-only 비밀번호(16바이트 파일), OTP, 무차별 대입 차단(5회 실패 / 10초, 이후 2배)
+  - OTP(사용자 결정): `minivnc-passwd -o [-v] [-display :N]`가 8자리 숫자를 만들어 루트 창 속성 `VNC_OTP`에 쓰면, 서버가 읽고 속성을 지운다(TurboVNC 방식). `-c`로 지운다. 한 번 성공하면 없어진다.
+  - 차단은 TurboVNC처럼 VNC 비밀번호 실패만 센다. 차단 중인 호스트는 인증 전에 ConnFailed로 거절한다.
+- [x] 보안 설정 파일(`/etc/minivncserver-security.conf`, 사용자 결정. TurboVNC 문법 호환 파서, 소유자/권한 검사)
+  - root나 서버 사용자 소유이고 그룹/기타 쓰기 권한이 없어야 한다. 파일이 없으면 기본값을 쓴다. 지원하지 않는 항목은 경고만 한다.
 - **DoD:** TurboVNC 뷰어의 기본 SecurityTypes 목록 순서대로 각 타입에 접속할 수 있다. 실패·차단 동작이 원본과 같다.
+- **검증 기록 (2026-11-03)**
+  - 환경: Windows 11의 TurboVNC 3.3.1 Java 뷰어와 MiniVNC 뷰어 → WSL Ubuntu 26.04의 MiniVNC 서버(`-source pattern`, 자체 서명 인증서 CN=localhost).
+  - **Java 뷰어, 기본 SecurityTypes**: 서버 기본 목록(tlsvnc, tlsotp, tlsplain, x509vnc, x509otp, x509plain, vnc, otp, unixlogin, plain)에서 Tight → VeNCrypt → TLSVnc를 골랐고, TLS 1.2 `ADH-AES256-GCM-SHA384`로 접속해 Continuous Updates까지 켜졌다.
+  - **Java 뷰어, 타입별**(`-securitytypes`로 하나씩): X509Vnc·X509None(TLS 1.3, `-X509CA`로 신뢰), TLSVnc·TLSNone(익명 DH), VNC, None은 접속했다. OTP는 설정 전 "The one-time password has not been set on the server"로 거절됐다. TLSPlain·X509Plain·UnixLogin은 틀린 비밀번호에 PAM이 AUTH_ERR를 돌려 "Authentication failed", 소유자가 아닌 사용자는 "User denied access"를 받았다.
+  - **차단**: 틀린 비밀번호로 4번은 "Authentication failed", 5번째는 "Authentication failed.  Client temporarily blocked", 그다음에는 맞는 비밀번호도 "Too many authentication failures.  Client temporarily blocked"로 거절됐다.
+  - **MiniVNC 뷰어 → MiniVNC 서버**: 기본 목록으로 TLSVnc 접속, X509Vnc는 모르는 발급자 확인에서 거절하면 "X.509 certificate not trusted", 수락하면 접속하고 저장한 뒤 다음 접속은 묻지 않았다. TLS 위에서 테스트 패턴이 계속 갱신됐다.
+  - **MiniVNC 뷰어 → TurboVNC 3.3.1 Xvnc**: 기본 목록(TLSVnc, `ADH-AES256-GCM-SHA384`), X509Vnc·X509None(TLS 1.3), VNC로 접속해 CU까지 켜졌다. 이 시험에서 뷰어가 Tight 상호작용 능력을 읽지 않아 ServerInit 다음 메시지를 잘못 해석하는 문제를 찾아 고쳤다(Java 뷰어 → MiniVNC 서버의 멈춤과 같은 원인).
+  - **OTP**(앞선 시험): WSL :7에서 설정 전 거절, 발급한 비밀번호로 한 번 성공, 재사용 거절.
+  - 루프백 테스트를 추가했다: Tight/VeNCrypt 로그인과 ACL, 차단, OTP, 익명 TLS와 X.509(거절, 수락 후 저장, 호스트 이름 불일치).
+  - **검증하지 못한 것**: 올바른 비밀번호로 PAM 로그인 성공. 사용자 비밀번호가 필요하고, `/etc/pam.d/minivnc` 설치에는 root가 필요하다.
 
 ### M7. 성능 기능 (3주)
 - [ ] **멀티스레드 Tight**
@@ -743,7 +764,7 @@ M3와 M4는 서로 독립적이어서 병렬로 진행할 수 있다(1인 기준
 | ------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 캡처형 서버는 Xvnc보다 손상 정보가 부정확하고 CopyRect를 알 수 없다 | 대역폭과 CPU 사용 증가   | interframe을 기본으로 켜고, XDamage 영역을 병합하고, 스크롤 감지로 보완한다. 필요하면 장기적으로 Xvfb 기반 "xf86 드라이버 모듈" 방식을 검토한다. |
 | zlib 출력 비호환(백엔드 차이)                                       | Tight 디코딩 실패        | 표준 zlib 스트림 형식만 쓴다(deflate 출력은 달라도 inflate 호환). 상호 운용 테스트로 확인한다.                                                   |
-| rustls에 익명 DH가 없다                                             | TLSNone/TLSVnc 미지원    | `openssl` feature로 제공하고, 기본 권장은 X509*로 한다.                                                                                          |
+| rustls에 익명 DH가 없다                                             | TLSNone/TLSVnc 미지원    | 모든 TLS를 OpenSSL로 처리한다(M6). Windows는 소스에서 빌드하므로 Strawberry Perl이 필요하다.                                                      |
 | 한글 IME와 키 입력 충돌(winit IME)                                  | 키가 누락되거나 중복된다 | 원격 세션 중에는 로컬 IME를 끄고, raw 스캔코드 경로를 쓴다. 한/영 키는 로컬에서 소비하지 않고 원격으로 보낸다.                                   |
 | libjpeg-turbo 빌드 의존성(Windows)                                  | 빌드가 복잡해진다        | `turbojpeg` 크레이트의 vendored 빌드를 쓰고, 순수 Rust JPEG 백엔드를 폴백으로 둔다.                                                              |
 | X 키보드 매핑의 복잡성                                              | 특수 레이아웃에서 오입력 | `input-xkb.c` 로직을 그대로 이식하고, QEMU 키 경로를 기본으로 한다.                                                                              |

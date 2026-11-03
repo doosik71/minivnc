@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 
 use rfb_auth::Password;
 use rfb_codec::tight::TightDecoder;
@@ -15,7 +16,12 @@ use rfb_proto::consts::*;
 use rfb_proto::handshake::{ClientInit, SecurityOffer, SecurityResult, ServerInit, Version};
 pub use rfb_proto::msg::Screen;
 use rfb_proto::msg::{ClientMessage, CutText, RectHeader, ServerMessage, ServerParseCtx};
+pub use rfb_proto::security::SecurityType;
+use rfb_proto::security::{Method, Tls};
 use rfb_proto::{Parsed, PixelFormat, ProtoError, Rect};
+
+mod tls;
+pub use tls::{Stream, Transport};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -30,8 +36,13 @@ pub enum ClientError {
     AuthFailed(Option<String>),
     /// None of the offered security types is usable.
     NoSecurityType(Vec<u8>),
+    /// The server offered nothing the client can use (Tight capabilities,
+    /// VeNCrypt subtypes).
+    NoMatchingSecurity(String),
     /// The server requires VNC authentication but no password was given.
     NeedPassword,
+    /// The server's X.509 certificate was rejected.
+    NotTrusted(String),
     UnsupportedVersion(Version),
     UnsupportedEncoding(i32),
 }
@@ -49,7 +60,9 @@ impl fmt::Display for ClientError {
             Self::NoSecurityType(offered) => {
                 write!(f, "no supported security type among {offered:?}")
             }
+            Self::NoMatchingSecurity(why) => f.write_str(why),
             Self::NeedPassword => f.write_str("server requires a VNC password"),
+            Self::NotTrusted(why) => f.write_str(why),
             Self::UnsupportedVersion(v) => {
                 write!(f, "unsupported RFB version {}.{}", v.major, v.minor)
             }
@@ -89,15 +102,91 @@ impl From<DecodeError> for ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+/// The TurboVNC viewer's default `SecurityTypes`.
+pub const DEFAULT_SECURITY_TYPES: [SecurityType; 10] = [
+    SecurityType::X509Plain,
+    SecurityType::X509Vnc,
+    SecurityType::X509None,
+    SecurityType::TlsPlain,
+    SecurityType::TlsVnc,
+    SecurityType::TlsNone,
+    SecurityType::Vnc,
+    SecurityType::Plain,
+    SecurityType::UnixLogin,
+    SecurityType::None,
+];
+
+/// Asks for a user name (offered the given one) and password.
+pub type AskLogin = fn(Option<&str>) -> io::Result<(String, String)>;
+
 #[derive(Clone, Debug, Default)]
 pub struct ConnectOptions {
+    /// Security types the client accepts (TurboVNC viewer `SecurityTypes`).
+    /// As in the TurboVNC viewer, the server's order decides among them.
+    /// Empty means [`DEFAULT_SECURITY_TYPES`].
+    pub security_types: Vec<SecurityType>,
     /// Enables VNC authentication.
     pub password: Option<Password>,
     /// Asked for the password when the server chooses VNC authentication
     /// and `password` is not set.
     pub ask_password: Option<fn() -> io::Result<Password>>,
+    /// User name and password for the Plain types (`plain`, `unixlogin`).
+    pub user: Option<String>,
+    pub login_password: Option<String>,
+    /// Asked for what is missing of the two when a Plain type is chosen.
+    pub ask_login: Option<AskLogin>,
+    /// The server's host name or address, which its X.509 certificate
+    /// should name.
+    pub host: String,
+    /// Extra trusted certificate authorities (TurboVNC viewer `X509CA`).
+    pub x509_ca: Option<PathBuf>,
+    /// Certificates the user accepted (TurboVNC viewer
+    /// `~/.vnc/x509_savedcerts.pem`); accepted ones are added.
+    pub saved_certs: Option<PathBuf>,
+    /// Asked whether to go on despite a certificate problem; without it,
+    /// such certificates are rejected.
+    pub confirm: Option<fn(&str) -> io::Result<bool>>,
     /// Ask the server to keep other clients connected.
     pub shared: bool,
+}
+
+impl ConnectOptions {
+    fn enabled(&self) -> &[SecurityType] {
+        if self.security_types.is_empty() {
+            &DEFAULT_SECURITY_TYPES
+        } else {
+            &self.security_types
+        }
+    }
+
+    /// Enabled, and what it needs is at hand.
+    fn usable(&self, t: SecurityType) -> bool {
+        self.enabled().contains(&t)
+            && match t.method() {
+                Method::None => true,
+                Method::Vnc => self.password.is_some() || self.ask_password.is_some(),
+                Method::Plain => {
+                    self.ask_login.is_some()
+                        || (self.user.is_some() && self.login_password.is_some())
+                }
+            }
+    }
+
+    fn vnc_password(&self) -> Result<Password> {
+        match (&self.password, self.ask_password) {
+            (Some(p), _) => Ok(p.clone()),
+            (None, Some(ask)) => Ok(ask()?),
+            (None, None) => Err(ClientError::NeedPassword),
+        }
+    }
+
+    fn login(&self) -> Result<(String, String)> {
+        match (&self.user, &self.login_password, self.ask_login) {
+            (Some(u), Some(p), _) => Ok((u.clone(), p.clone())),
+            (user, _, Some(ask)) => Ok(ask(user.as_deref())?),
+            _ => Err(ClientError::NeedPassword),
+        }
+    }
 }
 
 /// A server message, after any framebuffer update has been applied.
@@ -238,6 +327,10 @@ impl<S: Read + Write> Conn<S> {
         Ok(v)
     }
 
+    fn read_u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.read_array()?))
+    }
+
     fn read_vec(&mut self, n: usize) -> Result<Vec<u8>> {
         self.ensure(n)?;
         Ok(self.buf.drain(..n).collect())
@@ -247,6 +340,183 @@ impl<S: Read + Write> Conn<S> {
         self.stream.write_all(bytes)?;
         Ok(())
     }
+}
+
+/// Negotiates and runs the security type; returns how the client
+/// authenticated, which decides whether a SecurityResult follows, and
+/// whether it was through the Tight security type.
+fn security<S: Transport>(
+    conn: &mut Conn<S>,
+    version: Version,
+    options: &ConnectOptions,
+) -> Result<(Method, bool)> {
+    let types = match conn.parse(|b| SecurityOffer::parse(b, version))? {
+        SecurityOffer::Types(types) => types,
+        SecurityOffer::Failed(reason) => return Err(ClientError::ConnFailed(reason)),
+    };
+    let usable_rfb = |r: u8| {
+        SecurityType::ALL
+            .into_iter()
+            .any(|t| t.rfb_type() == r && options.usable(t))
+            || (r == SEC_TYPE_VENCRYPT
+                && SecurityType::ALL
+                    .into_iter()
+                    .any(|t| t.subtype().is_some() && t.rfb_type() != r && options.usable(t)))
+    };
+    let chosen = if version >= Version::V3_7 {
+        // TurboVNC viewer: Tight if offered, otherwise the server's first
+        // usable type.
+        let chosen = if types.contains(&SEC_TYPE_TIGHT) {
+            SEC_TYPE_TIGHT
+        } else {
+            *types
+                .iter()
+                .find(|&&t| t != SEC_TYPE_TIGHT && usable_rfb(t))
+                .ok_or_else(|| ClientError::NoSecurityType(types.clone()))?
+        };
+        conn.write(&[chosen])?;
+        chosen
+    } else {
+        match types[0] {
+            t @ (SEC_TYPE_NONE | SEC_TYPE_VNC_AUTH) if usable_rfb(t) => t,
+            SEC_TYPE_VNC_AUTH => return Err(ClientError::NeedPassword),
+            _ => return Err(ClientError::NoSecurityType(types)),
+        }
+    };
+    let method = match chosen {
+        SEC_TYPE_NONE => Method::None,
+        SEC_TYPE_VNC_AUTH => vnc_auth(conn, options)?,
+        SEC_TYPE_TIGHT => tight(conn, options)?,
+        SEC_TYPE_VENCRYPT => vencrypt(conn, options)?,
+        t => return Err(ClientError::NoSecurityType(vec![t])),
+    };
+    Ok((method, chosen == SEC_TYPE_TIGHT))
+}
+
+/// The Tight security type (TurboVNC `CSecurityTight`): the server's first
+/// authentication capability the client can use.
+fn tight<S: Transport>(conn: &mut Conn<S>, options: &ConnectOptions) -> Result<Method> {
+    if conn.read_u32()? > 0 {
+        conn.write(&NO_TUNNELING.to_be_bytes())?;
+    }
+    let count = conn.read_u32()?;
+    if count == 0 {
+        return Ok(Method::None);
+    }
+    let mut chosen = None;
+    let mut offered = Vec::new();
+    for _ in 0..count {
+        let cap: [u8; SZ_CAPABILITY_INFO] = conn.read_array()?;
+        let code = u32::from_be_bytes(cap[..4].try_into().expect("4 bytes"));
+        offered.push(code);
+        let matches = SecurityType::ALL.into_iter().any(|t| {
+            let (c, vendor, name) = t.auth_cap();
+            c == code && cap[4..8] == vendor[..] && cap[8..] == name[..] && options.usable(t)
+        });
+        // A VeNCrypt capability is usable if some subtype is.
+        let vencrypt = code == AUTH_VENCRYPT
+            && SecurityType::ALL
+                .into_iter()
+                .any(|t| t.subtype().is_some() && options.usable(t));
+        if chosen.is_none() && (matches || vencrypt) {
+            chosen = Some(code);
+        }
+    }
+    let Some(code) = chosen else {
+        return Err(ClientError::NoMatchingSecurity(format!(
+            "no usable Tight authentication type among {offered:?}"
+        )));
+    };
+    conn.write(&code.to_be_bytes())?;
+    match code {
+        AUTH_NONE => Ok(Method::None),
+        AUTH_VNC => vnc_auth(conn, options),
+        AUTH_VENCRYPT => vencrypt(conn, options),
+        _ => plain(conn, options),
+    }
+}
+
+/// VeNCrypt 0.2 (TurboVNC `CSecurityVeNCrypt`): the server's first subtype
+/// the client can use.
+fn vencrypt<S: Transport>(conn: &mut Conn<S>, options: &ConnectOptions) -> Result<Method> {
+    let [major, minor] = conn.read_array()?;
+    if (major, minor) < (0, 2) {
+        return Err(ClientError::NoMatchingSecurity(format!(
+            "VeNCrypt {major}.{minor} is too old"
+        )));
+    }
+    conn.write(&[0, 2])?;
+    let [ack] = conn.read_array()?;
+    if ack != 0 {
+        return Err(ClientError::NoMatchingSecurity(
+            "the server refused VeNCrypt 0.2".into(),
+        ));
+    }
+    let [count] = conn.read_array()?;
+    let mut subtypes = Vec::new();
+    for _ in 0..count {
+        subtypes.push(conn.read_u32()?);
+    }
+    let chosen = subtypes.iter().find_map(|&s| {
+        SecurityType::ALL
+            .into_iter()
+            .find(|&t| t.subtype() == Some(s) && options.usable(t))
+    });
+    let Some(t) = chosen else {
+        return Err(ClientError::NoMatchingSecurity(format!(
+            "no usable VeNCrypt subtype among {subtypes:?}"
+        )));
+    };
+    conn.write(&t.subtype().expect("found by subtype").to_be_bytes())?;
+    if let Some(kind) = t.tls() {
+        start_tls(conn, kind, options)?;
+    }
+    match t.method() {
+        Method::None => Ok(Method::None),
+        Method::Vnc => vnc_auth(conn, options),
+        Method::Plain => plain(conn, options),
+    }
+}
+
+/// The server's go-ahead, the TLS handshake, then the certificate checks.
+fn start_tls<S: Transport>(conn: &mut Conn<S>, kind: Tls, options: &ConnectOptions) -> Result<()> {
+    let [ok] = conn.read_array()?;
+    if ok != 1 {
+        return Err(ClientError::NoMatchingSecurity(
+            "the server could not start TLS".into(),
+        ));
+    }
+    if !conn.buf.is_empty() {
+        return Err(ClientError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server sent data before the TLS handshake",
+        )));
+    }
+    let chain = conn.stream.start_tls(tls::new_ssl(kind == Tls::Anon)?)?;
+    if kind == Tls::X509 {
+        tls::verify(&chain, options)?;
+    }
+    Ok(())
+}
+
+fn vnc_auth<S: Read + Write>(conn: &mut Conn<S>, options: &ConnectOptions) -> Result<Method> {
+    let password = options.vnc_password()?;
+    let challenge = conn.read_array()?;
+    conn.write(&rfb_auth::encrypt_challenge(&challenge, &password))?;
+    Ok(Method::Vnc)
+}
+
+/// User name and password, with their lengths in bytes (the TurboVNC
+/// viewer sends character counts, which breaks non-ASCII credentials).
+fn plain<S: Read + Write>(conn: &mut Conn<S>, options: &ConnectOptions) -> Result<Method> {
+    let (user, password) = options.login()?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&(user.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(password.len() as u32).to_be_bytes());
+    out.extend_from_slice(user.as_bytes());
+    out.extend_from_slice(password.as_bytes());
+    conn.write(&out)?;
+    Ok(Method::Plain)
 }
 
 pub struct Client<S> {
@@ -262,7 +532,7 @@ pub struct Client<S> {
     pending: VecDeque<Event>,
 }
 
-impl<S: Read + Write> Client<S> {
+impl<S: Transport> Client<S> {
     /// Runs the handshake up to and including `ServerInit`.
     pub fn connect(stream: S, options: &ConnectOptions) -> Result<Self> {
         let mut conn = Conn {
@@ -276,45 +546,10 @@ impl<S: Read + Write> Client<S> {
             .ok_or(ClientError::UnsupportedVersion(offered))?;
         conn.write(&version.to_bytes())?;
 
-        let types = match conn.parse(|b| SecurityOffer::parse(b, version))? {
-            SecurityOffer::Types(types) => types,
-            SecurityOffer::Failed(reason) => return Err(ClientError::ConnFailed(reason)),
-        };
-        let can_auth = options.password.is_some() || options.ask_password.is_some();
-        let usable: &[u8] = if can_auth {
-            &[SEC_TYPE_VNC_AUTH, SEC_TYPE_NONE]
-        } else {
-            &[SEC_TYPE_NONE]
-        };
-        let sec_type = if version >= Version::V3_7 {
-            // Like the TurboVNC viewer, take the server's order of preference.
-            let chosen = *types
-                .iter()
-                .find(|t| usable.contains(t))
-                .ok_or_else(|| ClientError::NoSecurityType(types.clone()))?;
-            conn.write(&[chosen])?;
-            chosen
-        } else {
-            match types[0] {
-                SEC_TYPE_VNC_AUTH if !can_auth => {
-                    return Err(ClientError::NeedPassword);
-                }
-                t @ (SEC_TYPE_NONE | SEC_TYPE_VNC_AUTH) => t,
-                _ => return Err(ClientError::NoSecurityType(types)),
-            }
-        };
-
-        if sec_type == SEC_TYPE_VNC_AUTH {
-            let password = match (&options.password, options.ask_password) {
-                (Some(p), _) => p.clone(),
-                (None, Some(ask)) => ask()?,
-                (None, None) => return Err(ClientError::NeedPassword),
-            };
-            let challenge = conn.read_array()?;
-            conn.write(&rfb_auth::encrypt_challenge(&challenge, &password))?;
-        }
-        // No SecurityResult for None before 3.8.
-        if (version >= Version::V3_8 || sec_type == SEC_TYPE_VNC_AUTH)
+        let (method, tight) = security(&mut conn, version, options)?;
+        // TurboVNC sends no SecurityResult before 3.8, except after a VNC
+        // password.
+        if (version >= Version::V3_8 || method == Method::Vnc)
             && let SecurityResult::Failed { reason, .. } =
                 conn.parse(|b| SecurityResult::parse(b, version))?
         {
@@ -328,6 +563,13 @@ impl<S: Read + Write> Client<S> {
         .write(&mut out);
         conn.write(&out)?;
         let init = conn.parse(ServerInit::parse)?;
+        if tight {
+            // The Tight interaction capabilities, which say nothing the
+            // client needs (as in the TurboVNC viewer).
+            let header: [u8; SZ_INTERACTION_CAPS_MSG] = conn.read_array()?;
+            let count = |i: usize| usize::from(u16::from_be_bytes([header[i], header[i + 1]]));
+            conn.read_vec((count(0) + count(2) + count(4)) * SZ_CAPABILITY_INFO)?;
+        }
         rfb_codec::translate::validate(&init.format)?;
 
         Ok(Self {
@@ -341,7 +583,9 @@ impl<S: Read + Write> Client<S> {
             pending: VecDeque::new(),
         })
     }
+}
 
+impl<S: Read + Write> Client<S> {
     pub fn version(&self) -> Version {
         self.version
     }

@@ -1,7 +1,8 @@
 //! Creates VNC password files compatible with TurboVNC `vncpasswd`.
 //!
-//! Supports `vncpasswd [-v] [FILE]` and `vncpasswd -f`. One-time passwords
-//! and user ACLs (`-o`, `-c`, `-a`, `-r`, `-t`) come with M6.
+//! Supports `vncpasswd [-v] [FILE]`, `vncpasswd -f`, and one-time passwords
+//! for a running server (`-o`, `-c`). The user ACL options (`-a`, `-r`,
+//! `-t`) are not supported.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -12,11 +13,17 @@ use rfb_auth::{MAX_PASSWORD_LEN, Password, Passwords};
 const USAGE: &str = "\
 usage: minivnc-passwd [-v] [FILE]
        minivnc-passwd -f
+       minivnc-passwd -o [-v] [-display DISPLAY]
+       minivnc-passwd -c [-display DISPLAY]
 
   FILE   password file to write (default: ~/.vnc/passwd)
   -v     also ask for a view-only password without asking first
+         (with -o: also make a view-only one-time password)
   -f     read the password (and an optional view-only password) from
-         standard input, one per line, and write the file to standard output";
+         standard input, one per line, and write the file to standard output
+  -o     make a one-time password for the server on the X display
+         (default: $DISPLAY) and print it; it works for one connection
+  -c     clear the one-time password";
 
 /// `vncpasswd` refuses shorter passwords when prompting.
 const MIN_PROMPTED_LEN: usize = 6;
@@ -37,10 +44,16 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut from_stdin = false;
     let mut also_view = false;
     let mut file = None;
-    for arg in args {
+    let mut otp = None;
+    let mut display = None;
+    let mut args = args;
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-f" => from_stdin = true,
             "-v" => also_view = true,
+            "-o" => otp = Some(true),
+            "-c" => otp = Some(false),
+            "-display" => display = Some(args.next().ok_or("-display needs a value")?),
             s if s.starts_with('-') => {
                 eprintln!("{USAGE}");
                 return Err(String::new());
@@ -48,6 +61,10 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             _ if file.is_some() => return Err("more than one file name".into()),
             _ => file = Some(PathBuf::from(arg)),
         }
+    }
+
+    if let Some(set) = otp {
+        return one_time_password(set, also_view, display.as_deref());
     }
 
     if from_stdin {
@@ -91,6 +108,36 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     Passwords { full, view_only }
         .write_file(&file)
         .map_err(|e| format!("cannot write password file {}: {e}", file.display()))
+}
+
+/// TurboVNC `vncpasswd -o`: eight decimal digits from a random number,
+/// given to the server through the X display.
+fn one_time_password(set: bool, also_view: bool, display: Option<&str>) -> Result<(), String> {
+    let mut value = Vec::new();
+    if set {
+        let random = rfb_auth::challenge().map_err(|e| e.to_string())?;
+        let mut digits = |i: usize, what: &str| {
+            let n = u32::from_be_bytes(random[i..i + 4].try_into().expect("4 bytes"));
+            let p: String = format!("{n:08}").chars().take(MAX_PASSWORD_LEN).collect();
+            eprintln!("{what} one-time password: {p}");
+            value.extend_from_slice(p.as_bytes());
+        };
+        digits(0, "Full control");
+        if also_view {
+            digits(4, "View-only");
+        }
+    }
+    set_otp(display, &value)
+}
+
+#[cfg(target_os = "linux")]
+fn set_otp(display: Option<&str>, value: &[u8]) -> Result<(), String> {
+    capture_x11::set_otp(display, value).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_otp(_: Option<&str>, _: &[u8]) -> Result<(), String> {
+    Err("one-time passwords need the X11 server (Linux)".into())
 }
 
 fn home_dir() -> Result<PathBuf, String> {

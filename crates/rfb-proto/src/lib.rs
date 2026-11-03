@@ -9,6 +9,7 @@ pub mod msg;
 mod parse;
 mod pixel_format;
 mod rect;
+pub mod security;
 pub mod wire;
 
 pub use parse::{Parsed, ProtoError};

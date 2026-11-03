@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use rfb_proto::PixelFormat;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ImageOrder, VisualClass};
+use x11rb::protocol::xproto::{ConnectionExt as _, ImageOrder, VisualClass};
 use x11rb::reexports::x11rb_protocol::parse_display::parse_display;
 use x11rb::reexports::x11rb_protocol::xauth::get_auth;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
@@ -110,6 +110,45 @@ fn connect(display: Option<&str>) -> io::Result<(RustConnection, usize)> {
         RustConnection::connect_to_stream_with_auth_info(stream, screen, auth_name, auth_data)
             .map_err(xerr)?;
     Ok((conn, screen))
+}
+
+/// The root window property for one-time passwords, as in TurboVNC.
+const OTP_PROPERTY: &[u8] = b"VNC_OTP";
+
+/// Creates the one-time password property name; `vncpasswd -o` refuses
+/// displays where it does not exist.
+fn otp_atom(conn: &RustConnection) -> io::Result<u32> {
+    Ok(conn
+        .intern_atom(false, OTP_PROPERTY)
+        .map_err(xerr)?
+        .reply()
+        .map_err(xerr)?
+        .atom)
+}
+
+/// Gives the MiniVNC (or TurboVNC) server on `display` a one-time
+/// password: 8 bytes, or 16 with a view-only one; empty clears it
+/// (TurboVNC `vncpasswd -o` / `-c`).
+pub fn set_otp(display: Option<&str>, value: &[u8]) -> io::Result<()> {
+    use x11rb::protocol::xproto::{AtomEnum, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+    let (conn, screen) = connect(display)?;
+    let atom = conn
+        .intern_atom(true, OTP_PROPERTY)
+        .map_err(xerr)?
+        .reply()
+        .map_err(xerr)?
+        .atom;
+    if atom == x11rb::NONE {
+        return Err(io::Error::other(
+            "the X display does not support VNC one-time passwords",
+        ));
+    }
+    let root = conn.setup().roots[screen].root;
+    conn.change_property8(PropMode::REPLACE, root, atom, AtomEnum::STRING, value)
+        .map_err(xerr)?
+        .check()
+        .map_err(xerr)
 }
 
 /// Opens `display` (or `$DISPLAY`) three times: for capture, for input

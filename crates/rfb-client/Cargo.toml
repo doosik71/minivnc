@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+openssl = "0.10.82"
 rfb-auth = { path = "../rfb-auth" }
 rfb-codec = { path = "../rfb-codec" }
 rfb-proto = { path = "../rfb-proto" }
@@ -19,3 +20,7 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "net"] }
 
 [lints]
 workspace = true
+
+# No system OpenSSL on Windows: build it (needs Strawberry Perl, see README).
+[target.'cfg(windows)'.dependencies]
+openssl = { version = "0.10.82", features = ["vendored"] }

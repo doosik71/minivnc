@@ -52,6 +52,9 @@ pub struct Changes {
     pub bell: bool,
     /// New clipboard text on the desktop.
     pub clipboard: Option<String>,
+    /// The one-time password was set (TurboVNC `vncpasswd -o`) or, with
+    /// `Some(None)`, cleared (`vncpasswd -c`).
+    pub otp: Option<Option<rfb_auth::Passwords>>,
 }
 
 impl From<Region> for Changes {
