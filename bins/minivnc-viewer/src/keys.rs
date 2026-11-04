@@ -84,10 +84,32 @@ fn named(key: NamedKey, right: bool) -> Option<u32> {
         NamedKey::PrintScreen => 0xff61,
         NamedKey::ContextMenu => 0xff67,
         NamedKey::Help => 0xff6a,
+        // Input method and layout switching (X11 keysymdef.h).
+        NamedKey::Compose => 0xff20,           // Multi_key
+        NamedKey::ModeChange => 0xff7e,        // Mode_switch
+        NamedKey::GroupNext => 0xfe08,         // ISO_Next_Group
+        NamedKey::GroupPrevious => 0xfe0a,     // ISO_Prev_Group
+        NamedKey::GroupFirst => 0xfe0c,        // ISO_First_Group
+        NamedKey::GroupLast => 0xfe0e,         // ISO_Last_Group
+        NamedKey::CodeInput => 0xff37,         // Codeinput
+        NamedKey::SingleCandidate => 0xff3c,   // SingleCandidate
+        NamedKey::AllCandidates => 0xff3d,     // MultipleCandidate
+        NamedKey::PreviousCandidate => 0xff3e, // PreviousCandidate
+        // Korean.
         NamedKey::HangulMode => 0xff31,
         NamedKey::HanjaMode => 0xff34,
+        NamedKey::JunjaMode => 0xff38, // Hangul_Jeonja
+        // Japanese. Windows reports the 半角/全角 key as Hankaku or Zenkaku
+        // by its state; X keymaps and IMEs know it as Zenkaku_Hankaku.
         NamedKey::Convert => 0xff23,    // Henkan
         NamedKey::NonConvert => 0xff22, // Muhenkan
+        NamedKey::KanjiMode => 0xff21,  // Kanji
+        NamedKey::KanaMode | NamedKey::HiraganaKatakana => 0xff27, // Hiragana_Katakana
+        NamedKey::Hiragana => 0xff25,
+        NamedKey::Katakana => 0xff26,
+        NamedKey::Romaji => 0xff24,
+        NamedKey::Zenkaku | NamedKey::Hankaku | NamedKey::ZenkakuHankaku => 0xff2a,
+        NamedKey::Eisu | NamedKey::Alphanumeric => 0xff30, // Eisu_toggle
         NamedKey::F1 => 0xffbe,
         NamedKey::F2 => 0xffbf,
         NamedKey::F3 => 0xffc0,
@@ -119,6 +141,11 @@ fn named(key: NamedKey, right: bool) -> Option<u32> {
 /// The keysym to send for a key press, or `None` to ignore the key.
 /// `logical` already has Shift and the layout applied (but not Ctrl).
 pub fn keysym(logical: &Key, physical: PhysicalKey, location: KeyLocation) -> Option<u32> {
+    // Windows gives the Japanese カタカナ/ひらがな key a different virtual
+    // key for each Shift/Alt and IME mode; X knows one key.
+    if physical == PhysicalKey::Code(KeyCode::KanaMode) {
+        return Some(0xff27); // Hiragana_Katakana
+    }
     if location == KeyLocation::Numpad
         && let Some(k) = keypad(logical)
     {
@@ -134,10 +161,14 @@ pub fn keysym(logical: &Key, physical: PhysicalKey, location: KeyLocation) -> Op
             }
         }
         // Without an IME, Korean keyboards may report the Hangul and
-        // Hanja keys only by position.
+        // Hanja keys only by position, as may the Katakana, Hiragana and
+        // Zenkaku/Hankaku keys of Japanese word-processing keyboards.
         _ => match physical {
             PhysicalKey::Code(KeyCode::Lang1) => Some(0xff31),
             PhysicalKey::Code(KeyCode::Lang2) => Some(0xff34),
+            PhysicalKey::Code(KeyCode::Lang3) => Some(0xff26),
+            PhysicalKey::Code(KeyCode::Lang4) => Some(0xff25),
+            PhysicalKey::Code(KeyCode::Lang5) => Some(0xff2a),
             _ => None,
         },
     }
@@ -245,9 +276,14 @@ pub fn qnum(logical: &Key, physical: PhysicalKey) -> Option<u32> {
         F11 => 0x57,
         F12 => 0x58,
         NumpadEqual => 0x59,
+        KanaMode => 0x70,
         Lang2 => 0x71,
         Lang1 => 0x72,
         IntlRo => 0x73,
+        // Not Lang5 (0x76): X maps it to XF86TouchpadToggle; the usual
+        // Zenkaku/Hankaku key is Backquote. Lang5 goes by keysym.
+        Lang4 => 0x77,
+        Lang3 => 0x78,
         Convert => 0x79,
         NonConvert => 0x7b,
         IntlYen => 0x7d,
@@ -303,6 +339,15 @@ mod tests {
         assert_eq!(qnum(&hangul, code(KeyCode::AltRight)), Some(0x72));
         let hanja = Key::Named(NamedKey::HanjaMode);
         assert_eq!(qnum(&hanja, code(KeyCode::ControlRight)), Some(0x71));
+        // Japanese: 半角/全角 stays at Backquote (<HZTG> = <TLDE>).
+        let hankaku = Key::Named(NamedKey::Hankaku);
+        assert_eq!(qnum(&hankaku, code(KeyCode::Backquote)), Some(0x29));
+        let kana = Key::Named(NamedKey::KanaMode);
+        assert_eq!(qnum(&kana, code(KeyCode::KanaMode)), Some(0x70));
+        let ua = Key::Unidentified(winit::keyboard::NativeKey::Unidentified);
+        assert_eq!(qnum(&ua, code(KeyCode::Lang3)), Some(0x78));
+        assert_eq!(qnum(&ua, code(KeyCode::Lang4)), Some(0x77));
+        assert_eq!(qnum(&ua, code(KeyCode::Lang5)), None);
         assert_eq!(
             qnum(
                 &a,
@@ -349,5 +394,38 @@ mod tests {
             ),
             Some(0xff31)
         );
+    }
+
+    #[test]
+    fn input_method_keys() {
+        let at = |key: NamedKey, code: KeyCode| {
+            keysym(
+                &Key::Named(key),
+                PhysicalKey::Code(code),
+                KeyLocation::Standard,
+            )
+        };
+        let named = |key: NamedKey| at(key, KeyCode::Backquote);
+        // Windows reports the 半角/全角 key by its state.
+        assert_eq!(named(NamedKey::Hankaku), Some(0xff2a));
+        assert_eq!(named(NamedKey::Zenkaku), Some(0xff2a));
+        assert_eq!(named(NamedKey::ZenkakuHankaku), Some(0xff2a));
+        assert_eq!(named(NamedKey::KanjiMode), Some(0xff21));
+        assert_eq!(named(NamedKey::HiraganaKatakana), Some(0xff27));
+        assert_eq!(named(NamedKey::Eisu), Some(0xff30));
+        assert_eq!(named(NamedKey::JunjaMode), Some(0xff38));
+        assert_eq!(named(NamedKey::GroupNext), Some(0xfe08));
+        assert_eq!(named(NamedKey::ModeChange), Some(0xff7e));
+        assert_eq!(named(NamedKey::Compose), Some(0xff20));
+        assert_eq!(named(NamedKey::AllCandidates), Some(0xff3d));
+        // The カタカナ/ひらがな key, whatever virtual key Windows gives it.
+        assert_eq!(at(NamedKey::Copy, KeyCode::KanaMode), Some(0xff27));
+        assert_eq!(at(NamedKey::Romaji, KeyCode::KanaMode), Some(0xff27));
+        // Japanese word-processing keys known only by position.
+        let ua = Key::Unidentified(winit::keyboard::NativeKey::Unidentified);
+        let pos = |code| keysym(&ua, PhysicalKey::Code(code), KeyLocation::Standard);
+        assert_eq!(pos(KeyCode::Lang3), Some(0xff26));
+        assert_eq!(pos(KeyCode::Lang4), Some(0xff25));
+        assert_eq!(pos(KeyCode::Lang5), Some(0xff2a));
     }
 }
