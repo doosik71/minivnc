@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- MiniVNC: a monitor showing a remote connection. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2F6FED"/>
+      <stop offset="1" stop-color="#1A3F9E"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0E2A66"/>
+      <stop offset="1" stop-color="#14367F"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <!-- Monitor and stand -->
+  <rect x="32" y="46" width="192" height="134" rx="16" fill="#FFFFFF"/>
+  <rect x="46" y="60" width="164" height="106" rx="7" fill="url(#screen)"/>
+  <path d="M110 180 h36 l6 20 h-48 z" fill="#FFFFFF"/>
+  <rect x="78" y="196" width="100" height="16" rx="8" fill="#FFFFFF"/>
+  <!-- Remote arrow -->
+  <path d="M84 146 L156 90" stroke="#5CE1FF" stroke-width="20" stroke-linecap="round"/>
+  <path d="M120 78 L172 76 L170 128 Z" fill="#5CE1FF" stroke="#5CE1FF" stroke-width="8" stroke-linejoin="round"/>
+</svg>

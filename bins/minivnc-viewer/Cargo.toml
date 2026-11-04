@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 arboard = { version = "3.7.0", default-features = false }
+png = "0.18"
 rfb-auth = { path = "../../crates/rfb-auth" }
 rfb-client = { path = "../../crates/rfb-client" }
 rfb-codec = { path = "../../crates/rfb-codec" }
@@ -21,6 +22,9 @@ softbuffer = "0.4.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 winit = "0.30"
+
+[build-dependencies]
+embed-resource = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

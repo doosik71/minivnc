@@ -26,7 +26,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
+use winit::window::{CustomCursor, Fullscreen, Icon, Window, WindowId};
 
 use crate::conn::{self, Notice, SharedClipboard, SharedScreen, Writer};
 use crate::connbar;
@@ -804,6 +804,24 @@ impl App {
     }
 }
 
+/// The MiniVNC icon (`assets/minivnc.svg`). Windows: the small one in the
+/// title bar, the large one on the taskbar; X11 takes the large one.
+const ICON_SMALL: &[u8] = include_bytes!("../../../assets/minivnc-32.png");
+const ICON_LARGE: &[u8] = include_bytes!("../../../assets/minivnc-256.png");
+
+fn icon(png_data: &[u8]) -> Option<Icon> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_data));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut rgba = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut rgba).ok()?;
+    if info.color_type != png::ColorType::Rgba {
+        return None;
+    }
+    rgba.truncate(info.buffer_size());
+    Icon::from_rgba(rgba, info.width, info.height).ok()
+}
+
 /// A 5x5 dot (black with a white rim), the TurboVNC viewer's local cursor
 /// until the server sends a cursor shape.
 fn dot_cursor() -> Vec<u8> {
@@ -830,7 +848,17 @@ impl ApplicationHandler<UserEvent> for App {
         let size = PhysicalSize::new(cw, ch);
         let mut attrs = Window::default_attributes()
             .with_title(&self.title)
-            .with_inner_size(size);
+            .with_inner_size(size)
+            .with_window_icon(icon(if cfg!(windows) {
+                ICON_SMALL
+            } else {
+                ICON_LARGE
+            }));
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_taskbar_icon(icon(ICON_LARGE));
+        }
         if let Some(max) = self.max_window() {
             attrs = attrs.with_max_inner_size(max);
         }
@@ -1172,6 +1200,12 @@ fn span_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icons_decode() {
+        assert!(icon(ICON_SMALL).is_some());
+        assert!(icon(ICON_LARGE).is_some());
+    }
 
     #[test]
     fn spanning_needs_equal_heights_or_widths() {

@@ -1,0 +1,2 @@
+// The executable's icon (build.rs).
+1 ICON "../../assets/minivnc.ico"
