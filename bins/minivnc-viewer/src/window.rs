@@ -954,6 +954,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.shown = None;
                 self.redraw();
             }
+            // Parts of the window off the monitors keep no contents; moving
+            // them on screen needs the whole frame again.
+            WindowEvent::Moved(_) => {
+                self.shown = None;
+                self.redraw();
+            }
             WindowEvent::Focused(true) => {
                 self.sync_lock_keys();
                 self.announce_clipboard();

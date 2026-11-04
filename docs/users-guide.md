@@ -105,7 +105,7 @@ bash scripts/start-minivnc-server.sh -n 1 -g 3840x2160 -p "$HOME/.vnc/passwd"
 minivnc-viewer server-host:1 -PasswordFile="$HOME/.vnc/passwd"
 ```
 
-비밀번호 파일 경로는 뷰어를 실행하는 컴퓨터의 파일이다. 서버에 있는 파일을 원격 경로로 지정하는 옵션이 아니다. 파일이 없으면 -PasswordFile을 생략하고 콘솔에 표시되는 비밀번호 요청에 응답한다.
+비밀번호 파일 경로는 뷰어를 실행하는 컴퓨터의 파일이다. 서버에 있는 파일을 원격 경로로 지정하는 옵션이 아니다. 파일이 없으면 -PasswordFile을 생략하고 콘솔에 표시되는 비밀번호 요청에 응답한다. Windows 뷰어는 콘솔 없이 실행되며, 서버 주소(인수로 준 값으로 채워짐)와 비밀번호를 연결 대화상자에서 입력받는다.
 
 ### 3.3 이미 실행 중인 X11 화면 공유
 

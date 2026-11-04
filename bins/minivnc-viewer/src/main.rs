@@ -3,10 +3,19 @@
 //! Options follow the TurboVNC viewer (`-Name=value`, case-insensitive).
 //! One thread reads and decodes server messages; the window runs on the
 //! main thread.
+//!
+//! On Windows the viewer is a GUI program without a console: it asks for
+//! the server and passwords in dialogs (`dialog`), so it neither needs a
+//! terminal nor ends with one.
+
+// Tests keep the console.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod config;
 mod conn;
 mod connbar;
+#[cfg(windows)]
+mod dialog;
 mod keys;
 mod platform;
 mod tunnel;
@@ -75,6 +84,11 @@ mean 1. ~/.vnc/default.turbovnc, if it exists, gives the defaults (options
 MiniVNC does not have are skipped). Set RUST_LOG (e.g. RUST_LOG=debug) to
 change the log level.
 
+Windows: a dialog asks for the server, filled with the one given, and the
+password, unless both are given (-Password or -PasswordFile) or with
+-listen. There is no console: errors appear in message boxes, and logs
+only where stderr is redirected (2> FILE).
+
 The maximize button switches to full screen; there, touch the top edge
 for the minimize/restore/close bar. Ctrl+Alt+Shift+F11 enters or leaves
 full screen; Ctrl+Alt+Shift+L asks the server for a lossless refresh.";
@@ -111,6 +125,10 @@ enum Grab {
 
 #[derive(Clone, Debug)]
 struct Options {
+    /// The server as given (`HOST:DISPLAY`, `HOST::PORT`), which the
+    /// connection dialog shows; empty if none.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    server: String,
     host: String,
     port: u16,
     password: Option<String>,
@@ -145,6 +163,7 @@ impl Default for Options {
     /// The TurboVNC viewer defaults ("Tight + Perceptually Lossless JPEG").
     fn default() -> Self {
         Self {
+            server: String::new(),
             host: String::new(),
             port: 5900,
             password: None,
@@ -437,9 +456,14 @@ fn parse_args(
         }
     }
     match (server, opts.listen) {
-        (Some(s), None) => (opts.host, opts.port) = parse_server(&s)?,
+        (Some(s), None) => {
+            (opts.host, opts.port) = parse_server(&s)?;
+            opts.server = s;
+        }
         (None, Some(_)) => {}
         (Some(_), Some(_)) => return Err("-listen takes no server".into()),
+        // The connection dialog asks for it.
+        (None, None) if cfg!(windows) => {}
         (None, None) => return Err("no server given".into()),
     }
     if opts.scale != Scale::Percent(100) && opts.auto_resize {
@@ -450,7 +474,31 @@ fn parse_args(
     Ok(opts)
 }
 
+#[cfg(windows)]
+fn cancelled() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled")
+}
+
+/// Unix Login / Plain credentials, asked in a dialog.
+#[cfg(windows)]
+fn ask_login(user: Option<&str>) -> std::io::Result<(String, String)> {
+    dialog::login(user).ok_or_else(cancelled)
+}
+
+/// Asks in a message box about a certificate problem.
+#[cfg(windows)]
+fn confirm(question: &str) -> std::io::Result<bool> {
+    Ok(dialog::confirm(question))
+}
+
+#[cfg(windows)]
+fn ask_password() -> std::io::Result<Password> {
+    let p = dialog::password().ok_or_else(cancelled)?;
+    Ok(Password::new(p.as_bytes()))
+}
+
 /// Unix Login / Plain credentials, asked on the console.
+#[cfg(not(windows))]
 fn ask_login(user: Option<&str>) -> std::io::Result<(String, String)> {
     let user = match user {
         Some(u) => u.to_string(),
@@ -466,6 +514,7 @@ fn ask_login(user: Option<&str>) -> std::io::Result<(String, String)> {
 }
 
 /// Asks on the console about a certificate problem.
+#[cfg(not(windows))]
 fn confirm(question: &str) -> std::io::Result<bool> {
     eprint!("{question} [y/N] ");
     let mut line = String::new();
@@ -482,6 +531,7 @@ fn vnc_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".vnc"))
 }
 
+#[cfg(not(windows))]
 fn ask_password() -> std::io::Result<Password> {
     let p = rpassword::prompt_password("Password: ")?;
     Ok(Password::new(p.as_bytes()))
@@ -519,6 +569,11 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     stream.set_nodelay(true)?;
+    #[cfg(windows)]
+    dialog::set_server(match opts.listen {
+        Some(_) => format!("{host}::{port}"),
+        None => opts.server.clone(),
+    });
     let stream = Stream::new(stream);
     let writer = conn::Writer::new(stream.clone());
     let vnc_dir = vnc_dir();
@@ -562,31 +617,99 @@ fn main() -> ExitCode {
         )
         .init();
     let defaults = vnc_dir().map(|d| d.join("default.turbovnc"));
-    let opts = match parse_args(std::env::args().skip(1), defaults.as_deref()) {
+    #[allow(unused_mut)]
+    let mut opts = match parse_args(std::env::args().skip(1), defaults.as_deref()) {
         Ok(o) => o,
         Err(e) => {
-            if !e.is_empty() {
-                eprintln!("minivnc-viewer: {e}\n");
-            }
-            eprintln!("{USAGE}");
+            usage_error(&e);
             return ExitCode::from(2);
         }
     };
+    #[cfg(windows)]
+    if !ask_server(&mut opts) {
+        return ExitCode::SUCCESS;
+    }
     if let Some(path) = &opts.save_config {
         match config::write(path, &opts) {
             Ok(()) => tracing::info!("options saved to {}", path.display()),
             Err(e) => {
-                eprintln!("minivnc-viewer: cannot save {}: {e}", path.display());
+                report(&format!("cannot save {}: {e}", path.display()));
                 return ExitCode::FAILURE;
             }
         }
     }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if is_cancelled(&*e) => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("minivnc-viewer: {e}");
+            report(&e.to_string());
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Prints `error` (empty for `-help`) and the usage. Windows: on the
+/// console the viewer was started from, or else in a message box.
+fn usage_error(error: &str) {
+    #[cfg(windows)]
+    if !dialog::attach_console() {
+        match error {
+            "" => dialog::info(USAGE),
+            e => dialog::error(&format!("{e}\n\nminivnc-viewer -help lists the options.")),
+        }
+        return;
+    }
+    if !error.is_empty() {
+        eprintln!("minivnc-viewer: {error}\n");
+    }
+    eprintln!("{USAGE}");
+}
+
+/// Reports an error on stderr and, on Windows, where stderr is usually
+/// nowhere, in a message box.
+fn report(error: &str) {
+    eprintln!("minivnc-viewer: {error}");
+    #[cfg(windows)]
+    dialog::error(error);
+}
+
+/// A dialog was cancelled.
+fn is_cancelled(e: &(dyn std::error::Error + 'static)) -> bool {
+    let io = match e.downcast_ref::<rfb_client::ClientError>() {
+        Some(rfb_client::ClientError::Io(io)) => Some(io),
+        _ => e.downcast_ref::<std::io::Error>(),
+    };
+    cfg!(windows) && io.is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+}
+
+/// Windows: the connection dialog, filled with the server given, unless
+/// nothing is missing (the server and a password are given) or in listen
+/// mode. `false` if it was cancelled.
+#[cfg(windows)]
+fn ask_server(opts: &mut Options) -> bool {
+    let has_password = opts.password.is_some() || opts.password_file.is_some();
+    if opts.listen.is_some() || (!opts.server.is_empty() && has_password) {
+        return true;
+    }
+    let mut server = opts.server.clone();
+    loop {
+        let Some((entered, password)) = dialog::connect(&server) else {
+            return false;
+        };
+        match parse_server(&entered) {
+            Ok(_) if entered.is_empty() => dialog::error("no server given"),
+            Ok((host, port)) => {
+                (opts.host, opts.port) = (host, port);
+                opts.server = entered;
+                // Empty: asked for if the server wants one.
+                if !password.is_empty() {
+                    opts.password = Some(password);
+                }
+                return true;
+            }
+            Err(e) => dialog::error(&e),
+        }
+        server = entered;
     }
 }
 
@@ -606,8 +729,15 @@ mod tests {
         assert_eq!(parse_server(":1").unwrap(), ("localhost".into(), 5901));
         assert_eq!(parse_server("host:5905").unwrap(), ("host".into(), 5905));
         assert!(parse_server("host:x").is_err());
-        assert!(parse(&[]).is_err());
+        // Windows asks for the server in the connection dialog.
+        if cfg!(windows) {
+            assert_eq!(parse(&[]).unwrap().host, "");
+        } else {
+            assert!(parse(&[]).is_err());
+        }
         assert!(parse(&["a:1", "b:2"]).is_err());
+        // As given, for the connection dialog.
+        assert_eq!(parse(&["host::5999"]).unwrap().server, "host::5999");
     }
 
     #[test]

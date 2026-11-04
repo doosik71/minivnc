@@ -1,2 +1,38 @@
-// The executable's icon (build.rs).
+// Windows resources (build.rs): the icon, the manifest and the dialogs of
+// src/dialog.rs, whose IDs must match these.
+#include <windows.h>
+
 1 ICON "../../assets/minivnc.ico"
+
+// Themed controls (Common Controls 6) and per-monitor DPI awareness.
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "minivnc-viewer.manifest"
+
+// The connection dialog; also the password dialog, with the server read-only.
+101 DIALOGEX 0, 0, 230, 78
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "MiniVNC Viewer"
+FONT 9, "MS Shell Dlg 2"
+BEGIN
+    LTEXT           "&Server:", -1, 7, 9, 48, 8
+    EDITTEXT        1001, 58, 7, 165, 14, ES_AUTOHSCROLL
+    LTEXT           "&Password:", -1, 7, 29, 48, 8
+    EDITTEXT        1003, 58, 27, 165, 14, ES_AUTOHSCROLL | ES_PASSWORD
+    DEFPUSHBUTTON   "Connect", IDOK, 119, 57, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 173, 57, 50, 14
+END
+
+// Unix Login / Plain authentication.
+102 DIALOGEX 0, 0, 230, 78
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "MiniVNC Viewer - Login"
+FONT 9, "MS Shell Dlg 2"
+BEGIN
+    LTEXT           "&User:", -1, 7, 9, 48, 8
+    EDITTEXT        1002, 58, 7, 165, 14, ES_AUTOHSCROLL
+    LTEXT           "&Password:", -1, 7, 29, 48, 8
+    EDITTEXT        1003, 58, 27, 165, 14, ES_AUTOHSCROLL | ES_PASSWORD
+    DEFPUSHBUTTON   "OK", IDOK, 119, 57, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 173, 57, 50, 14
+END

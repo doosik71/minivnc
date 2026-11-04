@@ -17,7 +17,6 @@ rfb-auth = { path = "../../crates/rfb-auth" }
 rfb-client = { path = "../../crates/rfb-client" }
 rfb-codec = { path = "../../crates/rfb-codec" }
 rfb-proto = { path = "../../crates/rfb-proto" }
-rpassword = "7.5.4"
 softbuffer = "0.4.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -29,8 +28,14 @@ embed-resource = "3"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# The console prompts; Windows asks in dialogs.
+[target.'cfg(not(windows))'.dependencies]
+rpassword = "7.5.4"

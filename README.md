@@ -180,11 +180,13 @@ minivnc-server :2 -rfbauth passwd -source pattern -geometry 800x600
 minivnc-server :2 -rfbauth passwd -source png:shots/
 
 # 뷰어로 접속 (Windows/Linux). 비밀번호 옵션이 없으면 필요할 때 콘솔에서 묻는다.
+# Windows 뷰어는 콘솔 없는 GUI 프로그램이다. 서버(인수로 준 값으로 채움)와 비밀번호를
+#   연결 대화상자에서 받고(둘 다 옵션으로 주면 생략), 다른 질문과 오류도 대화상자로 보인다.
 minivnc-viewer myhost:1
 minivnc-viewer myhost:1 -PasswordFile=passwd -Quality=80 -Subsampling=2X
 minivnc-viewer myhost::5901 -JPEG=0 -CompressLevel=0   # 무손실
 # TLS: 기본 SecurityTypes는 TurboVNC 뷰어와 같다. X509 인증서를 확인할 수
-#   없으면 콘솔에서 묻고, 수락한 인증서는 ~/.vnc/x509_savedcerts.pem에 저장한다.
+#   없으면 콘솔(Windows는 대화상자)에서 묻고, 수락한 인증서는 ~/.vnc/x509_savedcerts.pem에 저장한다.
 minivnc-viewer myhost:1 -SecurityTypes=X509Vnc -X509CA=ca.pem
 minivnc-viewer myhost:1 -User=alice                  # Unix Login / Plain
 # 그 밖의 옵션: -Password=PW, -Encoding=Tight|ZRLE|Hextile|Raw, -Shared=0,
