@@ -42,6 +42,11 @@ const PIXELS_PER_CLICK: f64 = 40.0;
 /// How long the window size must stay put before the remote desktop is
 /// resized to it.
 const RESIZE_DELAY: Duration = Duration::from_millis(500);
+/// Entering or leaving full screen: the window takes its new size in a
+/// few steps, all within `SWITCH_TIME`, and the remote desktop follows
+/// `SWITCH_RESIZE_DELAY` after the last (TurboVNC resizes at once too).
+const SWITCH_TIME: Duration = Duration::from_secs(1);
+const SWITCH_RESIZE_DELAY: Duration = Duration::from_millis(50);
 /// After leaving full-screen mode, the window may still report itself
 /// maximized for a moment; do not go back to full screen meanwhile.
 const RESTORE_GUARD: Duration = Duration::from_secs(1);
@@ -183,6 +188,8 @@ struct App {
     awaiting_resize: bool,
     /// When to resize the remote desktop to the window (Auto mode).
     resize_at: Option<Instant>,
+    /// Full screen was entered or left: resize the remote desktop soon.
+    switched_until: Option<Instant>,
     scale: Scale,
     span: Span,
     /// Full screen over several monitors: a borderless window, and where
@@ -273,10 +280,10 @@ impl App {
     }
 
     /// Full screen with no title bar: on the window's monitor, or across
-    /// all monitors as `Span` says.
+    /// all monitors as `Span` says, if they form a rectangle.
     fn enter_fullscreen(&mut self) {
+        self.switched_until = Some(Instant::now() + SWITCH_TIME);
         let Some(w) = &self.window else { return };
-        let monitors: Vec<_> = w.available_monitors().collect();
         let all = match self.span {
             Span::Primary => false,
             Span::All => true,
@@ -285,27 +292,35 @@ impl App {
                 cw > m.size().width || ch > m.size().height
             }),
         };
-        if !all || monitors.len() < 2 {
+        let area = all
+            .then(|| {
+                let monitors: Vec<_> = w
+                    .available_monitors()
+                    .map(|m| (m.position(), m.size()))
+                    .collect();
+                let area = span_area(&monitors);
+                if area.is_none() && monitors.len() > 1 {
+                    info!("monitors differ in height and width: full screen on one");
+                }
+                area
+            })
+            .flatten();
+        let Some((position, size)) = area else {
             w.set_fullscreen(Some(Fullscreen::Borderless(None)));
             self.update_grab();
             return;
-        }
+        };
         // winit has no full screen over several monitors: a borderless
         // window covering them all.
-        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-        for m in &monitors {
-            let (p, s) = (m.position(), m.size());
-            x0 = x0.min(p.x);
-            y0 = y0.min(p.y);
-            x1 = x1.max(p.x + s.width as i32);
-            y1 = y1.max(p.y + s.height as i32);
-        }
         let before = (w.outer_position().unwrap_or_default(), w.inner_size());
         w.set_maximized(false);
         w.set_decorations(false);
-        w.set_outer_position(PhysicalPosition::new(x0, y0));
-        let _ = w.request_inner_size(PhysicalSize::new((x1 - x0) as u32, (y1 - y0) as u32));
-        info!("full screen across {} monitors", monitors.len());
+        w.set_outer_position(position);
+        let _ = w.request_inner_size(size);
+        info!(
+            "full screen across monitors, {}x{}",
+            size.width, size.height
+        );
         self.spanning = Some(before);
         self.update_grab();
     }
@@ -314,6 +329,7 @@ impl App {
     fn leave_fullscreen(&mut self) {
         self.connbar = false;
         self.restore_guard = Some(Instant::now() + RESTORE_GUARD);
+        self.switched_until = Some(Instant::now() + SWITCH_TIME);
         if let Some(w) = &self.window {
             match self.spanning.take() {
                 Some((position, size)) => {
@@ -896,7 +912,12 @@ impl ApplicationHandler<UserEvent> for App {
                     && !self.view_only
                     && (size.width, size.height) != self.remote
                 {
-                    self.resize_at = Some(Instant::now() + RESIZE_DELAY);
+                    let now = Instant::now();
+                    let delay = match self.switched_until {
+                        Some(t) if now < t => SWITCH_RESIZE_DELAY,
+                        _ => RESIZE_DELAY,
+                    };
+                    self.resize_at = Some(now + delay);
                 }
                 self.redraw();
             }
@@ -908,25 +929,27 @@ impl ApplicationHandler<UserEvent> for App {
             // otherwise stay pressed on the server.
             WindowEvent::Focused(false) => self.release_all_keys(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            // TurboVNC viewer hot keys, which are not sent: Ctrl+Alt+Shift+L
-            // asks for a lossless refresh, Ctrl+Alt+Shift+G grabs or
-            // ungrabs the keyboard.
+            // Viewer hot keys, which are not sent: Ctrl+Alt+Shift+L asks
+            // for a lossless refresh, Ctrl+Alt+Shift+G grabs or ungrabs the
+            // keyboard (as the TurboVNC viewer), Ctrl+Alt+Shift+F11 enters
+            // or leaves full screen.
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: false,
                 ..
             } if matches!(
                 event.physical_key,
-                PhysicalKey::Code(KeyCode::KeyL | KeyCode::KeyG)
+                PhysicalKey::Code(KeyCode::KeyL | KeyCode::KeyG | KeyCode::F11)
             ) && self.modifiers.control_key()
                 && self.modifiers.alt_key()
                 && self.modifiers.shift_key() =>
             {
                 if event.state == ElementState::Pressed && !event.repeat {
-                    if event.physical_key == PhysicalKey::Code(KeyCode::KeyL) {
-                        self.lossless_refresh();
-                    } else {
-                        self.toggle_grab();
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyL) => self.lossless_refresh(),
+                        PhysicalKey::Code(KeyCode::KeyG) => self.toggle_grab(),
+                        _ if self.fullscreen() => self.leave_fullscreen(),
+                        _ => self.enter_fullscreen(),
                     }
                 }
             }
@@ -1099,6 +1122,7 @@ pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(),
         server_leds: None,
         awaiting_resize: false,
         resize_at: None,
+        switched_until: None,
         scale: opts.scale,
         span: opts.span,
         spanning: None,
@@ -1115,9 +1139,59 @@ pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(),
     }
 }
 
+/// The area full screen spans: all monitors, if there are several of the
+/// same height side by side or of the same width one above another. Other
+/// layouts leave parts of the bounding box off screen, the connection bar
+/// possibly among them.
+fn span_area(
+    monitors: &[(PhysicalPosition<i32>, PhysicalSize<u32>)],
+) -> Option<(PhysicalPosition<i32>, PhysicalSize<u32>)> {
+    let (p0, s0) = *monitors.first()?;
+    if monitors.len() < 2 {
+        return None;
+    }
+    let row = monitors
+        .iter()
+        .all(|(p, s)| p.y == p0.y && s.height == s0.height);
+    let column = monitors
+        .iter()
+        .all(|(p, s)| p.x == p0.x && s.width == s0.width);
+    if !row && !column {
+        return None;
+    }
+    let x0 = monitors.iter().map(|(p, _)| p.x).min()?;
+    let y0 = monitors.iter().map(|(p, _)| p.y).min()?;
+    let x1 = monitors.iter().map(|(p, s)| p.x + s.width as i32).max()?;
+    let y1 = monitors.iter().map(|(p, s)| p.y + s.height as i32).max()?;
+    Some((
+        PhysicalPosition::new(x0, y0),
+        PhysicalSize::new((x1 - x0) as u32, (y1 - y0) as u32),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spanning_needs_equal_heights_or_widths() {
+        let m = |x, y, w, h| (PhysicalPosition::new(x, y), PhysicalSize::new(w, h));
+        let area = |ms: &[_]| span_area(ms).map(|(p, s)| (p.x, p.y, s.width, s.height));
+        // 5120x1440 and 3840x2160: one monitor only.
+        assert_eq!(area(&[m(0, 0, 5120, 1440), m(5120, 0, 3840, 2160)]), None);
+        assert_eq!(area(&[m(0, 0, 1920, 1080)]), None);
+        // Side by side, and one above another.
+        assert_eq!(
+            area(&[m(1920, 0, 2560, 1080), m(0, 0, 1920, 1080)]),
+            Some((0, 0, 4480, 1080))
+        );
+        assert_eq!(
+            area(&[m(0, -1440, 2560, 1440), m(0, 0, 2560, 1080)]),
+            Some((0, -1440, 2560, 2520))
+        );
+        // The same height, not aligned.
+        assert_eq!(area(&[m(0, 0, 1920, 1080), m(1920, 200, 1920, 1080)]), None);
+    }
 
     #[test]
     fn visible_part_of_damage() {

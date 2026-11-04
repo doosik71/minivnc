@@ -56,8 +56,10 @@ usage: minivnc-viewer [options] HOST[:DISPLAY | ::PORT]
                         default 100), Auto (fit the window) or FixedRatio
                         (fit, keeping the aspect ratio); not 100 means
                         -DesktopSize=Server
-  -Span=MODE            full screen on the Primary monitor, All monitors, or
-                        Auto: all if the desktop does not fit on one
+  -Span=MODE            full screen on the window's monitor (Primary), All
+                        monitors, or Auto: all if the desktop does not fit
+                        on one; spanning needs monitors of the same height
+                        side by side or of the same width stacked
   -GrabKeyboard=MODE    pass Alt+Tab, Win and similar keys to the server
                         (Windows): FS (in full screen, default), Always, or
                         Manual; Ctrl+Alt+Shift+G grabs or ungrabs
@@ -74,8 +76,8 @@ MiniVNC does not have are skipped). Set RUST_LOG (e.g. RUST_LOG=debug) to
 change the log level.
 
 The maximize button switches to full screen; there, touch the top edge
-for the minimize/restore/close bar. Ctrl+Alt+Shift+L asks the server for a
-lossless refresh.";
+for the minimize/restore/close bar. Ctrl+Alt+Shift+F11 enters or leaves
+full screen; Ctrl+Alt+Shift+L asks the server for a lossless refresh.";
 
 /// TurboVNC viewer `Scale`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +95,7 @@ enum Span {
     Primary,
     All,
     /// All monitors if the remote desktop does not fit on the window's.
+    /// Spanning needs monitors that together form a rectangle.
     Auto,
 }
 

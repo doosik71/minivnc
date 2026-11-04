@@ -88,6 +88,8 @@ cargo build --release --workspace --features rfb-codec/turbojpeg   # Windows에�
 
 `cargo install`로 실행 파일을 `~/.cargo/bin`(Windows는 `%USERPROFILE%\.cargo\bin`)에 설치합니다. 이 디렉터리가 PATH에 있어야 합니다.
 
+`scripts/install-minivnc.sh [--tools] [--root DIR]`가 아래 과정을 한 번에 합니다. 빌드 요구 사항을 먼저 확인하고, 플랫폼에 맞는 패키지를 설치합니다(Linux: 서버·세션·비밀번호 도구·뷰어, Windows Git Bash: 뷰어·비밀번호 도구). 실행 중인 세션은 다시 시작해야 새 바이너리를 씁니다. Windows 명령 프롬프트에서는 같은 옵션으로 `scripts\install-minivnc.bat`를 씁니다(Strawberry Perl 확인, 짧은 빌드 경로 `C:\t`).
+
 ```sh
 # Linux: 서버, 세션 관리, 비밀번호 도구, 뷰어
 for p in minivnc-server minivnc-session minivnc-passwd minivnc-viewer; do
@@ -187,8 +189,10 @@ minivnc-viewer myhost:1 -User=alice                  # Unix Login / Plain
 #   -ViewOnly, -DesktopSize=Auto|Server (Auto: 창 크기에 맞춰 원격 화면 크기를 바꾼다)
 # 스케일: -Scale=50 (10~400%), -Scale=Auto (창에 맞춤), -Scale=FixedRatio
 #   (비율 유지). 100이 아니면 DesktopSize는 Server가 된다.
-# 전체 화면: -Span=Primary|All|Auto (All: 모든 모니터에 걸친다. Auto: 원격
-#   화면이 한 모니터보다 크면 All)
+# 전체 화면: 창이 있는 모니터에 표시한다. Ctrl+Alt+Shift+F11: 전체 화면 켜고 끄기.
+#   -Span=Primary|All|Auto (All: 모든 모니터에 걸친다. Auto: 원격 화면이 한
+#   모니터보다 크면 All). 여러 모니터에 걸치는 것은 높이가 같은 모니터가 가로로,
+#   또는 폭이 같은 모니터가 세로로 놓였을 때만이다. 아니면 창이 있는 모니터만 쓴다.
 # 키보드 그랩(Windows, Alt+Tab·Win 키 등을 원격으로): -GrabKeyboard=FS|Always|Manual
 #   (FS: 전체 화면일 때). Ctrl+Alt+Shift+G: 그랩 켜고 끄기.
 # 최대화 버튼: 전체 화면. 위쪽 가장자리 가운데에 마우스를 대면

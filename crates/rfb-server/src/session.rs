@@ -288,6 +288,8 @@ struct Session<'a> {
     /// Areas the client asked for and has not received yet.
     requested: Region,
     bounds: Region,
+    /// The framebuffer size the client was last told.
+    client_size: Rect,
     /// Continuous updates are on for this area.
     cu_region: Option<Region>,
     /// A `SyncNext` fence to answer after the next message, and the one
@@ -316,7 +318,8 @@ impl<'a> Session<'a> {
         let screen = shared.screen();
         let fb = &screen.plain;
         let translator = Translator::new(fb.format(), fb.format()).map_err(io::Error::other)?;
-        let bounds = Region::from(to_region_rect(fb.bounds()));
+        let client_size = fb.bounds();
+        let bounds = Region::from(to_region_rect(client_size));
         drop(screen);
         Ok(Self {
             conn,
@@ -344,6 +347,7 @@ impl<'a> Session<'a> {
             modified: Region::new(),
             requested: Region::new(),
             bounds,
+            client_size,
             cu_region: None,
             pending_sync: None,
             syncing: false,
@@ -929,6 +933,7 @@ impl<'a> Session<'a> {
         (reason, result): DesktopSizeReply,
     ) -> io::Result<()> {
         let fb = self.shared.screen().plain.bounds();
+        self.client_size = fb;
         let mut out = Vec::new();
         write_framebuffer_update_header(&mut out, 1);
         RectHeader {
@@ -952,6 +957,7 @@ impl<'a> Session<'a> {
     /// TurboVNC `rfbSendDesktopSize` (NewFBSize).
     async fn send_desktop_size(&mut self) -> io::Result<()> {
         let fb = self.shared.screen().plain.bounds();
+        self.client_size = fb;
         let mut out = Vec::new();
         write_framebuffer_update_header(&mut out, 1);
         RectHeader {
@@ -1054,6 +1060,21 @@ impl<'a> Session<'a> {
         } else {
             &screen.drawn
         };
+        // The screen may have been resized since the changes were noted,
+        // and again since the client was told its size; the Resized update
+        // still to come sends the new size and the whole screen. Until
+        // then, only the part that is on the screen, on the client's
+        // framebuffer and on the comparison copy can be sent.
+        for limit in [
+            Some(fb.bounds()),
+            Some(self.client_size),
+            self.compare.as_ref().map(Framebuffer::bounds),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            update = update.intersect(&Region::from(to_region_rect(limit)));
+        }
         let mut redundant = false;
         if self.compare.is_some() && !self.in_alr {
             let started = Instant::now();

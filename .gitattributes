@@ -1,2 +1,4 @@
 # Shell scripts run on Linux (also from a Windows checkout under WSL).
 *.sh text eol=lf
+# Batch files run in cmd, which needs CRLF line endings.
+*.bat text eol=crlf

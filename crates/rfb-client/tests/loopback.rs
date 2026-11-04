@@ -826,6 +826,91 @@ fn desktop_resize() {
     assert_eq!(rects, [Rect::new(0, 0, 320, 240)]);
 }
 
+/// [`Scripted`] whose reads take a while, as reading a whole X screen
+/// does after a resize: sessions wait for the screen meanwhile.
+struct SlowReads(Scripted);
+
+impl FrameSource for SlowReads {
+    fn width(&self) -> u16 {
+        self.0.width()
+    }
+    fn height(&self) -> u16 {
+        self.0.height()
+    }
+    fn format(&self) -> PixelFormat {
+        self.0.format()
+    }
+    fn wait_changes(&mut self, timeout: Duration) -> std::io::Result<Changes> {
+        self.0.wait_changes(timeout)
+    }
+    fn read(&mut self, region: &Region, fb: &mut Framebuffer) -> std::io::Result<()> {
+        std::thread::sleep(Duration::from_millis(2));
+        self.0.read(region, fb)
+    }
+}
+
+/// The screen grows, changes all over and shrinks again, quicker than the
+/// session follows: changes noted at one size must not be sent at
+/// another (they were, past the end of the framebuffer).
+#[test]
+fn quick_resizes_keep_updates_on_the_framebuffer() {
+    let (source, script) = scripted();
+    let addr = start_with(SlowReads(source), no_auth(Config::default()), None);
+    let mut client = connect(addr, None).unwrap();
+    client
+        .set_encodings(&[ENCODING_RAW, ENCODING_EXTENDED_DESKTOP_SIZE])
+        .unwrap();
+    let (big, small) = ((600, 400), (W, H));
+    let feeder = std::thread::spawn(move || {
+        let resized = Changes {
+            resized: true,
+            ..Changes::default()
+        };
+        let all = Region::from(rfb_region::Rect::from_xywh(
+            0,
+            0,
+            big.0.into(),
+            big.1.into(),
+        ));
+        for _ in 0..100 {
+            // Time for the client to learn the large size and ask for all
+            // of it, then a change all over it and, at once, a smaller
+            // screen.
+            script.send((Some(big), resized.clone())).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            let damage = Changes {
+                damage: all.clone(),
+                ..Changes::default()
+            };
+            script.send((None, damage)).unwrap();
+            script.send((Some(small), resized.clone())).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    // Keep asking for the whole framebuffer, at whatever size it is.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let fb = client.framebuffer();
+        let (w, h) = (fb.width(), fb.height());
+        client.request_update(true, Rect::new(0, 0, w, h)).unwrap();
+        wait_event(&mut client, |e| {
+            matches!(
+                e,
+                Event::FramebufferUpdate(_) | Event::ExtendedDesktopSize { .. }
+            )
+            .then_some(())
+        });
+        if feeder.is_finished() && (w, h) == small {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resizes did not settle"
+        );
+    }
+    feeder.join().unwrap();
+}
+
 /// Takes QEMU key codes and records them.
 #[derive(Clone, Default)]
 struct QemuRecorder(Recorder);

@@ -323,6 +323,17 @@ impl X11Source {
         Ok(())
     }
 
+    /// The root window is no longer the size last seen.
+    fn screen_size_changed(&self) -> io::Result<bool> {
+        let g = self
+            .conn
+            .get_geometry(self.display.root)
+            .map_err(xerr)?
+            .reply()
+            .map_err(xerr)?;
+        Ok((g.width, g.height) != (self.display.width, self.display.height))
+    }
+
     /// Follows a screen size change: new size and a matching SHM segment.
     fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
         info!("X screen resized to {width}x{height}");
@@ -340,6 +351,13 @@ impl X11Source {
         }
         Ok(())
     }
+}
+
+/// An X `BadMatch` error, which `GetImage` gives for an area off screen.
+fn is_match_error(e: &io::Error) -> bool {
+    e.get_ref()
+        .and_then(|e| e.downcast_ref::<ReplyError>())
+        .is_some_and(|e| matches!(e, ReplyError::X11Error(x) if x.error_kind == x11rb::protocol::ErrorKind::Match))
 }
 
 /// Selects XKB indicator and bell events; returns the indicator indices of
@@ -530,6 +548,16 @@ impl FrameSource for X11Source {
         let mut region = region.clone();
         region.collapse_if_over(100);
         let rects: Vec<Rect> = region.rects().iter().map(to_wire_rect).collect();
-        self.read_rects(&rects, fb)
+        match self.read_rects(&rects, fb) {
+            // The screen shrank after the damage was reported (a viewer's
+            // resizes in quick succession): the rectangles now reach past
+            // it. The ConfigureNotify still queued resizes and rereads the
+            // whole screen.
+            Err(e) if is_match_error(&e) && self.screen_size_changed()? => {
+                debug!("screen size changed while reading it; skipped");
+                Ok(())
+            }
+            r => r,
+        }
     }
 }
