@@ -108,6 +108,8 @@ struct Shown {
     remote: (usize, usize),
     /// The remote desktop is drawn scaled.
     scaled: bool,
+    /// The connection bar is drawn over it; hiding it needs a full frame.
+    connbar: bool,
 }
 
 /// How many frames' damage is kept for buffers presented that long ago.
@@ -560,6 +562,7 @@ impl App {
             layout: l,
             remote: (rw, rh),
             scaled,
+            connbar: self.connbar,
         };
 
         // Only the changed pixels, if the buffer holds an earlier frame of
@@ -1250,6 +1253,7 @@ mod tests {
             },
             remote: (200, 150),
             scaled: false,
+            connbar: false,
         };
         // Clipped to the view, which shows remote (10, 20)-(100, 90).
         assert_eq!(
