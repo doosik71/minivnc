@@ -947,6 +947,11 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     self.resize_at = Some(now + delay);
                 }
+                // The window may have lost its contents (Windows drops
+                // them while it is minimized, and a restore to the same
+                // size keeps the softbuffer buffer "presented"), so the
+                // next frame is drawn in full.
+                self.shown = None;
                 self.redraw();
             }
             WindowEvent::Focused(true) => {

@@ -4,14 +4,20 @@ rem minivnc-viewer, minivnc-passwd, LICENSE, NOTICE and README.md (VERSION
 rem from the workspace Cargo.toml). The Linux archive is made by
 rem scripts/create-distro.sh.
 rem
-rem usage: scripts\create-distro.bat [--out DIR]
+rem usage: scripts\create-distro.bat [--out DIR] [--no-turbojpeg]
+rem                                   [--target-dir DIR]
 rem
-rem   --out DIR   write the archive to DIR (default: target\tmp)
+rem   --out DIR         write the archive to DIR (default: target\tmp)
+rem   --no-turbojpeg    decode JPEG with the pure Rust codec instead of
+rem                     libjpeg-turbo (which needs CMake and NASM)
+rem   --target-dir DIR  build into DIR (default: %CARGO_TARGET_DIR%, or
+rem                     target in the repository, as
+rem                     scripts\build-minivnc.bat)
 rem
 rem The vendored OpenSSL build needs Strawberry Perl (Git's perl does not
 rem work); C:\Strawberry\perl\bin is put first on the PATH if it exists.
-rem It also fails on long build paths, so the build goes to
-rem %CARGO_TARGET_DIR%, or C:\t if that is not set.
+rem It also fails on long build paths ("files missing"); then build into a
+rem short one such as --target-dir C:\t.
 
 setlocal EnableDelayedExpansion
 
@@ -19,6 +25,8 @@ rem (`shift` moves %0 too: the script's own paths come first.)
 set "self=%~f0"
 for %%d in ("%~dp0..") do set "repo=%%~fd"
 set "out=%repo%\target\tmp"
+set "turbojpeg=1"
+set "target="
 :args
 if "%~1"=="" goto args_done
 if /i "%~1"=="--out" (
@@ -28,6 +36,22 @@ if /i "%~1"=="--out" (
         goto fail
     )
     set "out=%~f2"
+    shift
+    shift
+    goto args
+)
+if /i "%~1"=="--no-turbojpeg" (
+    set "turbojpeg=0"
+    shift
+    goto args
+)
+if /i "%~1"=="--target-dir" (
+    if "%~2"=="" (
+        set "msg=--target-dir needs a value"
+        set "code=2"
+        goto fail
+    )
+    set "target=%~f2"
     shift
     shift
     goto args
@@ -56,8 +80,26 @@ if not defined OPENSSL_SRC_PERL (
         goto fail
     )
 )
-set "target=%CARGO_TARGET_DIR%"
-if not defined target set "target=C:\t"
+set "cargo_args=--release --locked -p minivnc-viewer -p minivnc-passwd"
+if "%turbojpeg%"=="1" (
+    for %%c in (cmake nasm) do (
+        where %%c >nul 2>&1 || (
+            set "msg=%%c not found (needed for libjpeg-turbo; or use --no-turbojpeg)"
+            goto fail
+        )
+    )
+    set "cargo_args=!cargo_args! --features rfb-codec/turbojpeg"
+)
+if defined target (
+    set "cargo_args=!cargo_args! --target-dir "!target!""
+) else if defined CARGO_TARGET_DIR (
+    rem A relative CARGO_TARGET_DIR is relative to the workspace.
+    pushd "%repo%"
+    for %%t in ("%CARGO_TARGET_DIR%") do set "target=%%~ft"
+    popd
+) else (
+    set "target=%repo%\target"
+)
 
 rem The first `version = "..."` line is [workspace.package].
 set "version="
@@ -76,10 +118,13 @@ set "name=minivnc-%version%-windows-%arch%"
 set "bins=minivnc-viewer minivnc-passwd"
 
 echo == building %bins%
-cargo build --release --locked --target-dir "%target%" -p minivnc-viewer -p minivnc-passwd || (
+pushd "%repo%"
+cargo build %cargo_args% || (
+    popd
     set "msg=build failed"
     goto fail
 )
+popd
 
 set "stage=%out%\%name%"
 if not exist "%out%" mkdir "%out%" || (

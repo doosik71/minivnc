@@ -3,9 +3,11 @@
 # minivnc-server, minivnc-session, minivnc-passwd, minivnc-viewer, LICENSE,
 # NOTICE and README.md (VERSION from the workspace Cargo.toml).
 #
-# usage: scripts/create-distro.sh [--out DIR]
+# usage: scripts/create-distro.sh [--out DIR] [--target-dir DIR]
 #
-#   --out DIR   write the archive to DIR (default: target/tmp)
+#   --out DIR         write the archive to DIR (default: target/tmp)
+#   --target-dir DIR  build into DIR (default: $CARGO_TARGET_DIR, or target
+#                     in the repository, as scripts/build-minivnc.sh)
 #
 # The Windows archive is made by scripts\create-distro.bat.
 #
@@ -16,11 +18,14 @@ set -u
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 out=$repo/target/tmp
+target=
 while [ $# -gt 0 ]; do
     case $1 in
         --out) [ $# -ge 2 ] || { echo "create-distro.sh: --out needs a value" >&2; exit 2; }
                out=$2; shift ;;
-        *) sed -n '2,13s/^# \{0,1\}//p' "$0"; exit 2 ;;
+        --target-dir) [ $# -ge 2 ] || { echo "create-distro.sh: --target-dir needs a value" >&2; exit 2; }
+                      target=$2; shift ;;
+        *) sed -n '2,15s/^# \{0,1\}//p' "$0"; exit 2 ;;
     esac
     shift
 done
@@ -44,12 +49,23 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -n 1)
 [ -n "$version" ] || fail "no version in $repo/Cargo.toml"
 name=minivnc-$version-linux-$(uname -m)
 bins=(minivnc-server minivnc-session minivnc-passwd minivnc-viewer)
-target=${CARGO_TARGET_DIR:-$repo/target}
 
-pkg_args=()
-for b in "${bins[@]}"; do pkg_args+=(-p "$b"); done
+cargo_args=(--release --locked)
+for b in "${bins[@]}"; do cargo_args+=(-p "$b"); done
+if [ -n "$target" ]; then
+    # Relative to where the script was run, not the workspace.
+    mkdir -p "$target" && target=$(cd "$target" && pwd) || fail "cannot create $target"
+    cargo_args+=(--target-dir "$target")
+else
+    # A relative CARGO_TARGET_DIR is relative to the workspace.
+    target=${CARGO_TARGET_DIR:-target}
+    case $target in
+        /*) ;;
+        *) target=$repo/$target ;;
+    esac
+fi
 echo "== building ${bins[*]}"
-(cd "$repo" && cargo build --release --locked "${pkg_args[@]}") || fail "build failed"
+(cd "$repo" && cargo build "${cargo_args[@]}") || fail "build failed"
 
 mkdir -p "$out" || fail "cannot create $out"
 out=$(cd "$out" && pwd)

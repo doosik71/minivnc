@@ -82,13 +82,15 @@ cargo build --release
 cargo build --release --workspace --features rfb-codec/turbojpeg   # Windows에서 libjpeg-turbo 사용
 ```
 
+`scripts/build-minivnc.sh [--debug] [--tools] [--no-turbojpeg] [--target-dir DIR]`(Windows 명령 프롬프트는 `scripts\build-minivnc.bat`)는 빌드 요구 사항을 확인한 뒤 플랫폼에 맞는 패키지를 빌드하고 결과 위치를 출력합니다. Windows에서도 libjpeg-turbo를 기본으로 씁니다(`--no-turbojpeg`이면 순수 Rust). 빌드 위치는 기본적으로 `CARGO_TARGET_DIR` 또는 저장소의 `target`이고, OpenSSL 빌드가 긴 경로 때문에 실패하면 `--target-dir C:\t`처럼 짧은 경로를 지정합니다.
+
 빌드 결과는 `target/release/`에 생깁니다(`minivnc-server`, `minivnc-viewer`, `minivnc-passwd`, `minivnc-session`, `rfb-snapshot`, `rfb-bench`; Windows는 `.exe`).
 
 ### 설치
 
 `cargo install`로 실행 파일을 `~/.cargo/bin`(Windows는 `%USERPROFILE%\.cargo\bin`)에 설치합니다. 이 디렉터리가 PATH에 있어야 합니다.
 
-`scripts/install-minivnc.sh [--tools] [--root DIR]`가 아래 과정을 한 번에 합니다. 빌드 요구 사항을 먼저 확인하고, 플랫폼에 맞는 패키지를 설치합니다(Linux: 서버·세션·비밀번호 도구·뷰어, Windows Git Bash: 뷰어·비밀번호 도구). 실행 중인 세션은 다시 시작해야 새 바이너리를 씁니다. Windows 명령 프롬프트에서는 같은 옵션으로 `scripts\install-minivnc.bat`를 씁니다(Strawberry Perl 확인, 짧은 빌드 경로 `C:\t`).
+`scripts/install-minivnc.sh [--tools] [--root DIR] [--no-turbojpeg] [--target-dir DIR]`가 아래 과정을 한 번에 합니다. 빌드 요구 사항을 먼저 확인하고, 플랫폼에 맞는 패키지를 설치합니다(Linux: 서버·세션·비밀번호 도구·뷰어, Windows Git Bash: 뷰어·비밀번호 도구). 실행 중인 세션은 다시 시작해야 새 바이너리를 씁니다. Windows 명령 프롬프트에서는 같은 옵션으로 `scripts\install-minivnc.bat`를 씁니다(Strawberry Perl 확인). JPEG 설정과 빌드 위치의 기본값이 `build-minivnc`와 같으므로, 먼저 빌드했다면 그 결과를 다시 씁니다.
 
 ```sh
 # Linux: 서버, 세션 관리, 비밀번호 도구, 뷰어
