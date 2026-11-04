@@ -13,7 +13,7 @@ use rfb_proto::msg::{
     ClientMessage, ClientParseCtx, CutText, RectHeader, Screen as ScreenDesc, ServerMessage,
     write_framebuffer_update_header,
 };
-use rfb_proto::wire::WriteBe;
+use rfb_proto::wire::{RecvBuf, WriteBe};
 use rfb_proto::{Parsed, ProtoError, Rect};
 use rfb_region::Region;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -52,6 +52,10 @@ struct Profile {
     /// Time spent producing and writing updates, and only producing them.
     busy: Duration,
     encoding: Duration,
+    /// Parts of `encoding`: waiting for the screen lock, and interframe
+    /// comparison.
+    lock_wait: Duration,
+    interframe: Duration,
 }
 
 impl Profile {
@@ -63,6 +67,8 @@ impl Profile {
             bytes: 0,
             busy: Duration::ZERO,
             encoding: Duration::ZERO,
+            lock_wait: Duration::ZERO,
+            interframe: Duration::ZERO,
         }
     }
 
@@ -80,12 +86,14 @@ impl Profile {
         let per_update = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(self.updates);
         info!(
             client = id,
-            "{:.2} updates/sec, {:.2} Mpixels/sec, {:.3} Mbits/sec; time/update: encode = {:.3} ms (without writing {:.3} ms), other = {:.3} ms",
+            "{:.2} updates/sec, {:.2} Mpixels/sec, {:.3} Mbits/sec; time/update: encode = {:.3} ms (without writing {:.3} ms, of which screen lock wait {:.3} ms, interframe {:.3} ms), other = {:.3} ms",
             f64::from(self.updates) / secs,
             self.pixels as f64 / 1e6 / secs,
             self.bytes as f64 * 8.0 / 1e6 / secs,
             per_update(self.busy),
             per_update(self.encoding),
+            per_update(self.lock_wait),
+            per_update(self.interframe),
             per_update(elapsed.saturating_sub(self.busy)),
         );
         *self = Self::new();
@@ -128,7 +136,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 /// Socket plus bytes received but not yet parsed.
 pub(crate) struct Conn {
     pub stream: Box<dyn Stream>,
-    pub buf: Vec<u8>,
+    pub buf: RecvBuf,
     scratch: Vec<u8>,
     /// Bytes written so far (wrapping): the stream position for flow
     /// control.
@@ -143,7 +151,7 @@ impl Conn {
     fn new(stream: Box<dyn Stream>) -> Self {
         Self {
             stream,
-            buf: Vec::new(),
+            buf: RecvBuf::default(),
             scratch: vec![0; 64 * 1024],
             sent: 0,
         }
@@ -155,16 +163,18 @@ impl Conn {
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        self.buf.extend_from_slice(&self.scratch[..n]);
+        self.buf.extend(&self.scratch[..n]);
         Ok(())
     }
 
     /// Returns the next buffered value, if a whole one has arrived.
     fn try_parse<T>(&mut self, parse: impl Fn(&[u8]) -> Parsed<T>) -> io::Result<Option<T>> {
-        Ok(parse(&self.buf).map_err(proto_error)?.map(|(v, n)| {
-            self.buf.drain(..n);
-            v
-        }))
+        Ok(parse(self.buf.pending())
+            .map_err(proto_error)?
+            .map(|(v, n)| {
+                self.buf.consume(n);
+                v
+            }))
     }
 
     pub async fn parse<T>(&mut self, parse: impl Fn(&[u8]) -> Parsed<T>) -> io::Result<T> {
@@ -192,7 +202,9 @@ impl Conn {
         while self.buf.len() < n {
             self.fill().await?;
         }
-        Ok(self.buf.drain(..n).collect())
+        let v = self.buf.pending()[..n].to_vec();
+        self.buf.consume(n);
+        Ok(v)
     }
 
     pub async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1022,7 +1034,10 @@ impl<'a> Session<'a> {
         num_pseudo: u32,
     ) -> io::Result<(Vec<u8>, u64, bool)> {
         let shared = self.shared;
+        let asked = Instant::now();
         let screen = shared.screen();
+        let lock_wait = asked.elapsed();
+        let mut interframe = Duration::ZERO;
         let fb = if self.uses_cursor_shape() {
             &screen.plain
         } else {
@@ -1030,12 +1045,18 @@ impl<'a> Session<'a> {
         };
         let mut redundant = false;
         if self.compare.is_some() && !self.in_alr {
+            let started = Instant::now();
             update = self.interframe(fb, &update);
+            interframe = started.elapsed();
             // TurboVNC: some viewers stop asking after an empty update.
             if update.is_empty() {
                 update = Region::from(rfb_region::Rect::from_xywh(0, 0, 1, 1));
                 redundant = true;
             }
+        }
+        if let Some(p) = &mut self.profile {
+            p.lock_wait += lock_wait;
+            p.interframe += interframe;
         }
         let settings = if self.in_alr {
             let config = &self.shared.config;
@@ -1109,14 +1130,13 @@ impl<'a> Session<'a> {
                 }
                 .map_err(io::Error::other)?;
             }
+            // Taken every time, or the encoder's record would grow for the
+            // life of the connection without ALR.
+            let jpeg = self.tight.take_lossy();
             if self.shared.config.alr.is_some() {
-                let jpeg = self
-                    .tight
-                    .take_lossy()
-                    .into_iter()
-                    .fold(Region::new(), |r, j| {
-                        r.union(&Region::from(to_region_rect(j)))
-                    });
+                let jpeg = jpeg.into_iter().fold(Region::new(), |r, j| {
+                    r.union(&Region::from(to_region_rect(j)))
+                });
                 self.lossy = self.lossy.subtract(&update).union(&jpeg);
             }
         }

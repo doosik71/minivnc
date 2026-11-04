@@ -82,7 +82,7 @@ cargo build --release
 cargo build --release --workspace --features rfb-codec/turbojpeg   # Windows에서 libjpeg-turbo 사용
 ```
 
-## 현재 시험해 볼 수 있는 것 (M6)
+## 현재 시험해 볼 수 있는 것 (M7)
 
 ```sh
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
@@ -112,6 +112,10 @@ minivnc-passwd -o -display :1      # -v: view-only OTP도, -c: 지우기
 #   -alwaysshared / -nevershared / -disconnect, -pointerlocktimeout MS,
 #   -noflowcontrol, -noremoteresize, -maxclipboard BYTES, -noclipboardsend,
 #   -noclipboardrecv, -noprimarysync
+# 성능(TurboVNC와 같은 옵션): -nthreads N / -nomt (Tight 인코딩 스레드),
+#   -interframe / -nointerframe (기본: CL 5 이상에서 켬),
+#   -alr SECS [-alrqual Q] [-alrsamp 1X|2X|4X|Gray] (JPEG 영역 무손실 재전송),
+#   -profile (5초마다 업데이트·인코딩·캡처 통계)
 
 # 테스트 화면 서버(모든 플랫폼): 움직이는 패턴 또는 PNG 파일/디렉터리, 포트 5902
 minivnc-server :2 -rfbauth passwd -source pattern -geometry 800x600
@@ -128,11 +132,17 @@ minivnc-viewer myhost:1 -User=alice                  # Unix Login / Plain
 # 그 밖의 옵션: -Password=PW, -Encoding=Tight|Raw, -Shared=0, -ViewOnly,
 #   -DesktopSize=Auto|Server (Auto: 창 크기에 맞춰 원격 화면 크기를 바꾼다)
 # 최대화 버튼: 전체 화면. 위쪽 가장자리 가운데에 마우스를 대면
-#   최소화·복원·닫기 바가 나타난다.
+#   최소화·복원·닫기 바가 나타난다. Ctrl+Alt+Shift+L: 무손실 새로 고침 요청.
 
 # 아무 VNC 서버에 접속해 화면을 PNG로 저장하고 받은 바이트 수를 출력
 # (프리셋: lossless, lossless-zlib, perceptual, medium, low, raw)
 rfb-snapshot -passwd passwd -preset medium localhost:2 screen.png
+
+# 서버 처리량 측정(업데이트/s, Mpixel/s, Mbit/s)과 녹화·디코딩 재생
+rfb-bench -passwd passwd -preset perceptual -time 30 localhost:2
+rfb-bench -passwd passwd -record session.rfb localhost:2
+rfb-bench -replay session.rfb
+# TurboVNC와 같은 부하로 비교하는 방법과 결과: docs/bench.md
 ```
 
 ## 사용 예 (예정)

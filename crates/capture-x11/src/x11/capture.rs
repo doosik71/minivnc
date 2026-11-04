@@ -55,6 +55,8 @@ pub struct X11Source {
     shm: Option<(shm::Seg, Segment)>,
     cursor_ok: bool,
     pointer: (u16, u16),
+    /// When the pointer position was last asked for.
+    pointer_asked: Instant,
     /// XKB indicator index of Caps, Num and Scroll Lock (if any).
     indicators: [Option<u8>; 3],
     /// Changes found before the first `wait_changes`.
@@ -146,6 +148,7 @@ impl X11Source {
             shm,
             cursor_ok,
             pointer: (0, 0),
+            pointer_asked: Instant::now(),
             indicators,
             initial: Changes::default(),
             clipboard,
@@ -457,6 +460,14 @@ impl FrameSource for X11Source {
                     other => debug!(?other, "ignoring X event"),
                 }
             }
+            // At most every POINTER_POLL, and sent now so that its round
+            // trip overlaps the damage request's.
+            let pointer = if self.cursor_ok && self.pointer_asked.elapsed() >= POINTER_POLL {
+                self.pointer_asked = Instant::now();
+                Some(self.conn.query_pointer(self.display.root).map_err(xerr)?)
+            } else {
+                None
+            };
             if damaged {
                 // Clear the damage so the next change is reported again,
                 // collecting it if it was not in the events.
@@ -486,13 +497,8 @@ impl FrameSource for X11Source {
                 changes.clipboard = Some(text);
             }
 
-            if self.cursor_ok {
-                let p = self
-                    .conn
-                    .query_pointer(self.display.root)
-                    .map_err(xerr)?
-                    .reply()
-                    .map_err(xerr)?;
+            if let Some(cookie) = pointer {
+                let p = cookie.reply().map_err(xerr)?;
                 let pos = (p.root_x.max(0) as u16, p.root_y.max(0) as u16);
                 if pos != self.pointer {
                     self.pointer = pos;

@@ -132,6 +132,25 @@ impl Translator {
         self.colour_map.as_deref()
     }
 
+    /// No conversion: the client gets the server's pixels as they are.
+    pub fn is_identity(&self) -> bool {
+        matches!(self.kind, Kind::Identity)
+    }
+
+    /// One server pixel value in the client format.
+    pub fn translate_pixel(&self, p: u32) -> u32 {
+        match &self.kind {
+            Kind::Identity => p,
+            Kind::Single(table) => table[p as usize],
+            Kind::Rgb([r, g, b]) => {
+                let s = &self.server;
+                let channel =
+                    |t: &[u32], i: usize| t[((p >> s.shift[i]) & u32::from(s.max[i])) as usize];
+                channel(r, 0) | channel(g, 1) | channel(b, 2)
+            }
+        }
+    }
+
     /// Appends the pixels of `rect` from `fb` in the client format.
     pub fn translate_rect(
         &self,
@@ -150,20 +169,9 @@ impl Translator {
             let row = fb.rect_row(rect, y);
             match &self.kind {
                 Kind::Identity => out.extend_from_slice(row),
-                Kind::Single(table) => {
+                Kind::Single(_) | Kind::Rgb(_) => {
                     for p in row.chunks_exact(in_bpp) {
-                        let v = table[read_pixel(p, self.server.big_endian) as usize];
-                        write_pixel(out, v, out_bpp, self.client.big_endian);
-                    }
-                }
-                Kind::Rgb([r, g, b]) => {
-                    let s = &self.server;
-                    for p in row.chunks_exact(in_bpp) {
-                        let p = read_pixel(p, s.big_endian);
-                        let channel = |t: &[u32], i: usize| {
-                            t[((p >> s.shift[i]) & u32::from(s.max[i])) as usize]
-                        };
-                        let v = channel(r, 0) | channel(g, 1) | channel(b, 2);
+                        let v = self.translate_pixel(read_pixel(p, self.server.big_endian));
                         write_pixel(out, v, out_bpp, self.client.big_endian);
                     }
                 }

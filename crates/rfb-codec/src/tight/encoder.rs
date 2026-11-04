@@ -15,7 +15,7 @@ use super::zstream::Deflater;
 use super::{MIN_TO_COMPRESS, pack24, uses_tpixel};
 use crate::CodecError;
 use crate::framebuffer::{Framebuffer, read_pixel, unpack_rgb, write_pixel};
-use crate::jpeg::{self, Layout, Subsampling};
+use crate::jpeg::{Image, JpegCompressor, Layout, Subsampling};
 use crate::translate::Translator;
 
 /// Rectangles at least this large are searched for solid areas.
@@ -137,6 +137,8 @@ impl TightSettings {
 /// the connection.
 pub struct TightEncoder {
     streams: [Option<Deflater>; 4],
+    /// One per band, kept to reuse the libjpeg-turbo handles.
+    jpeg: [JpegCompressor; MAX_THREADS],
     threads: usize,
     /// Rectangles sent as JPEG since the last [`TightEncoder::take_lossy`].
     lossy: Vec<Rect>,
@@ -159,6 +161,7 @@ impl TightEncoder {
     pub fn with_threads(threads: usize) -> Self {
         Self {
             streams: Default::default(),
+            jpeg: Default::default(),
             threads: threads.clamp(1, MAX_THREADS),
             lossy: Vec::new(),
         }
@@ -224,9 +227,10 @@ impl TightEncoder {
             i32::from(rect.w),
             i32::from(rect.h),
         );
-        let new_job = |streams, base_stream, out| Job {
+        let new_job = |streams, base_stream, jpeg, out| Job {
             streams,
             base_stream,
+            jpeg,
             fb,
             translator,
             settings,
@@ -238,7 +242,7 @@ impl TightEncoder {
             lossy: Vec::new(),
         };
         if nt == 1 {
-            let mut job = new_job(&mut self.streams[..], 0, out);
+            let mut job = new_job(&mut self.streams[..], 0, &mut self.jpeg[0], out);
             job.send_rect(x, y, w, h)?;
             self.lossy.append(&mut job.lossy);
             return Ok(());
@@ -246,6 +250,7 @@ impl TightEncoder {
 
         // The four streams divided evenly, the last band taking the rest.
         let mut rest = &mut self.streams[..];
+        let mut jpegs = self.jpeg.iter_mut();
         let mut jobs = Vec::with_capacity(nt);
         // The first band writes to `out`, the others to buffers appended
         // afterwards.
@@ -267,7 +272,8 @@ impl TightEncoder {
             } else {
                 h / nt as i32
             };
-            jobs.push((new_job(mine, base, band_out), band_y, band_h));
+            let jpeg = jpegs.next().expect("one JPEG compressor per band");
+            jobs.push((new_job(mine, base, jpeg, band_out), band_y, band_h));
         }
         let mut results: Vec<Result<(), CodecError>> = (0..nt).map(|_| Ok(())).collect();
         rayon::scope(|s| {
@@ -293,6 +299,7 @@ struct Job<'a> {
     /// `base_stream`.
     streams: &'a mut [Option<Deflater>],
     base_stream: usize,
+    jpeg: &'a mut JpegCompressor,
     fb: &'a Framebuffer,
     translator: &'a Translator,
     settings: &'a TightSettings,
@@ -306,44 +313,39 @@ struct Job<'a> {
     lossy: Vec<Rect>,
 }
 
-/// The byte layout of a 32bpp format with 8-bit channels in whole bytes,
-/// which the JPEG encoder can read directly.
-fn jpeg_layout(f: &PixelFormat) -> Option<Layout> {
-    if f.bpp != 32 || f.max != [255; 3] || f.shift.iter().any(|s| s % 8 != 0) {
-        return None;
-    }
-    let byte = |shift: u8| {
-        let i = usize::from(shift / 8);
-        if f.big_endian { 3 - i } else { i }
-    };
-    match f.shift.map(byte) {
-        [0, 1, 2] => Some(Layout::Rgbx),
-        [2, 1, 0] => Some(Layout::Bgrx),
-        _ => None,
+/// Pixel values of packed pixels.
+fn pixel_values(buf: &[u8], format: &PixelFormat) -> Vec<u32> {
+    let mut out = Vec::with_capacity(buf.len() / usize::from(format.bpp / 8));
+    push_pixel_values(buf, format, &mut out);
+    out
+}
+
+/// Appends the pixel values of packed pixels; the common 32bpp case is
+/// kept simple enough to vectorise.
+fn push_pixel_values(buf: &[u8], format: &PixelFormat, out: &mut Vec<u32>) {
+    match (format.bpp, format.big_endian) {
+        (32, false) => out.extend(
+            buf.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&p| u32::from_le_bytes(p)),
+        ),
+        (32, true) => out.extend(
+            buf.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&p| u32::from_be_bytes(p)),
+        ),
+        (bpp, big_endian) => out.extend(
+            buf.chunks_exact(usize::from(bpp / 8))
+                .map(|p| read_pixel(p, big_endian)),
+        ),
     }
 }
 
-/// Pixel values of packed client pixels; the common 32bpp case is kept
-/// simple enough to vectorise.
-fn pixel_values(buf: &[u8], format: &PixelFormat) -> Vec<u32> {
-    match (format.bpp, format.big_endian) {
-        (32, false) => buf
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&p| u32::from_le_bytes(p))
-            .collect(),
-        (32, true) => buf
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&p| u32::from_be_bytes(p))
-            .collect(),
-        (bpp, big_endian) => buf
-            .chunks_exact(usize::from(bpp / 8))
-            .map(|p| read_pixel(p, big_endian))
-            .collect(),
-    }
+/// The bits of a pixel value that hold colour.
+fn channel_mask(f: &PixelFormat) -> u32 {
+    (0..3).fold(0, |m, i| m | u32::from(f.max[i]) << f.shift[i])
 }
 
 fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
@@ -451,10 +453,8 @@ impl Job<'_> {
 
                     let solid = rect(x_best, y_best, w_best, h_best);
                     self.send_header(solid);
-                    let mut px = Vec::new();
-                    self.translator
-                        .translate_rect(self.fb, rect(x_best, y_best, 1, 1), &mut px)?;
-                    self.send_solid(&px);
+                    let pixel = self.fb.pixel(x_best as u16, y_best as u16);
+                    self.send_solid(self.translator.translate_pixel(pixel));
 
                     // Areas right of and below it.
                     if x_best + w_best != x + w {
@@ -587,17 +587,52 @@ impl Job<'_> {
             max_colours = 2;
         }
 
-        let mut buf = Vec::new();
-        self.translator.translate_rect(self.fb, r, &mut buf)?;
-        let bpp = usize::from(self.client.bpp / 8);
-        let pixels = pixel_values(&buf, &self.client);
+        let server = *self.fb.format();
+        let translator = self.translator;
+        if server.bpp == self.client.bpp && server.max == self.client.max && server.bpp >= 16 {
+            // TurboVNC `FastFillPalette`: colours are counted on the server
+            // pixels and only the ones sent are translated, so rectangles
+            // that go out as JPEG are never translated. Translation keeps
+            // distinct colours distinct here, so the result is the same.
+            let mut pixels = Vec::with_capacity(r.area() as usize);
+            for dy in 0..r.h {
+                push_pixel_values(self.fb.rect_row(r, dy), &server, &mut pixels);
+            }
+            if !translator.is_identity() {
+                let mask = channel_mask(&server);
+                pixels.iter_mut().for_each(|p| *p &= mask);
+            }
+            let colour = |p| translator.translate_pixel(p);
+            match classify(&pixels, max_colours, true) {
+                Colours::Full if self.settings.quality.is_some() => self.send_jpeg(r)?,
+                Colours::Full => {
+                    let mut buf = Vec::new();
+                    translator.translate_rect(self.fb, r, &mut buf)?;
+                    if translator.is_identity() {
+                        // The values counted are the client's already.
+                        self.send_full_colour(&buf, &pixels);
+                    } else {
+                        let client_pixels = pixel_values(&buf, &self.client);
+                        self.send_full_colour(&buf, &client_pixels);
+                    }
+                }
+                Colours::Solid => self.send_solid(colour(pixels[0])),
+                Colours::Mono { bg, fg } => self.send_mono(&pixels, w as usize, bg, fg, colour),
+                Colours::Indexed(palette) => self.send_indexed(&pixels, &palette, colour),
+            }
+            return Ok(());
+        }
 
+        let mut buf = Vec::new();
+        translator.translate_rect(self.fb, r, &mut buf)?;
+        let pixels = pixel_values(&buf, &self.client);
+        let same = |p| p;
         match classify(&pixels, max_colours, self.client.bpp != 8) {
             Colours::Full if self.settings.quality.is_some() => self.send_jpeg(r)?,
             Colours::Full => self.send_full_colour(&buf, &pixels),
-            Colours::Solid => self.send_solid(&buf[..bpp]),
-            Colours::Mono { bg, fg } => self.send_mono(&pixels, w as usize, bg, fg),
-            Colours::Indexed(palette) => self.send_indexed(&pixels, &palette),
+            Colours::Solid => self.send_solid(pixels[0]),
+            Colours::Mono { bg, fg } => self.send_mono(&pixels, w as usize, bg, fg, same),
+            Colours::Indexed(palette) => self.send_indexed(&pixels, &palette, same),
         }
         Ok(())
     }
@@ -637,20 +672,28 @@ impl Job<'_> {
         }
     }
 
-    fn send_solid(&mut self, pixel: &[u8]) {
+    /// `value` is a client pixel value.
+    fn send_solid(&mut self, value: u32) {
         self.out.put_u8(TIGHT_FILL << 4);
-        let value = read_pixel(pixel, self.client.big_endian);
         self.put_colour(value);
     }
 
-    fn send_mono(&mut self, pixels: &[u32], w: usize, bg: u32, fg: u32) {
+    /// `colour` gives the client value of the colours in `pixels`.
+    fn send_mono(
+        &mut self,
+        pixels: &[u32],
+        w: usize,
+        bg: u32,
+        fg: u32,
+        colour: impl Fn(u32) -> u32,
+    ) {
         let stream = self.next_stream();
         let level = self.conf.mono_zlib_level;
         self.out.put_u8(self.basic_ctl(stream, level, true));
         self.out.put_u8(TIGHT_FILTER_PALETTE);
         self.out.put_u8(1);
-        self.put_colour(bg);
-        self.put_colour(fg);
+        self.put_colour(colour(bg));
+        self.put_colour(colour(fg));
 
         let mut data = Vec::with_capacity(pixels.len() / 8 + pixels.len() / w.max(1));
         for row in pixels.chunks(w) {
@@ -665,14 +708,20 @@ impl Job<'_> {
         self.compress_data(stream, &data, level);
     }
 
-    fn send_indexed(&mut self, pixels: &[u32], palette: &super::palette::Palette) {
+    /// `colour` gives the client value of the colours in `pixels`.
+    fn send_indexed(
+        &mut self,
+        pixels: &[u32],
+        palette: &super::palette::Palette,
+        colour: impl Fn(u32) -> u32,
+    ) {
         let stream = self.next_stream();
         let level = self.conf.idx_zlib_level;
         self.out.put_u8(self.basic_ctl(stream, level, true));
         self.out.put_u8(TIGHT_FILTER_PALETTE);
         self.out.put_u8((palette.len() - 1) as u8);
         for c in palette.colours() {
-            self.put_colour(c);
+            self.put_colour(colour(c));
         }
         let data: Vec<u8> = pixels.iter().map(|&p| palette.index_of(p)).collect();
         self.compress_data(stream, &data, level);
@@ -722,41 +771,42 @@ impl Job<'_> {
             self.send_full_colour(&buf, &pixels);
             return Ok(());
         }
-        let (layout, pixels) = match jpeg_layout(format) {
-            // Rows copied as they are; the encoder reads 32bpp pixels.
-            Some(layout) => {
-                let mut pixels = Vec::with_capacity(r.area() as usize * 4);
-                for dy in 0..r.h {
-                    pixels.extend_from_slice(self.fb.rect_row(r, dy));
-                }
-                (layout, pixels)
-            }
+        let rgb;
+        let image = match Layout::of(format) {
+            // 32bpp pixels are read where they are.
+            Some(layout) => Image {
+                data: self.fb.rect_bytes(r),
+                layout,
+                pitch: self.fb.stride(),
+                w: r.w,
+                h: r.h,
+            },
             None => {
                 let bpp = self.fb.bytes_per_pixel();
-                let mut rgb = Vec::with_capacity(r.area() as usize * 3);
+                let mut packed = Vec::with_capacity(r.area() as usize * 3);
                 for dy in 0..r.h {
                     for p in self.fb.rect_row(r, dy).chunks_exact(bpp) {
-                        rgb.extend_from_slice(&unpack_rgb(
+                        packed.extend_from_slice(&unpack_rgb(
                             format,
                             read_pixel(p, format.big_endian),
                         ));
                     }
                 }
-                (Layout::Rgb, rgb)
+                rgb = packed;
+                Image {
+                    data: &rgb,
+                    layout: Layout::Rgb,
+                    pitch: usize::from(r.w) * 3,
+                    w: r.w,
+                    h: r.h,
+                }
             }
         };
         let mut jpeg_data = Vec::new();
         let quality = self.settings.quality.expect("JPEG only with a quality");
-        jpeg::compress(
-            &pixels,
-            layout,
-            r.w,
-            r.h,
-            quality,
-            self.settings.subsampling,
-            &mut jpeg_data,
-        )
-        .map_err(CodecError::Jpeg)?;
+        self.jpeg
+            .compress(image, quality, self.settings.subsampling, &mut jpeg_data)
+            .map_err(CodecError::Jpeg)?;
         self.out.put_u8(TIGHT_JPEG << 4);
         self.out.put_compact_len(jpeg_data.len());
         self.out.extend_from_slice(&jpeg_data);

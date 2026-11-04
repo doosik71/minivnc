@@ -233,3 +233,71 @@ mod tests {
         Vec::new().put_compact_len(MAX_COMPACT_LEN + 1);
     }
 }
+
+/// Bytes received but not yet parsed. Parsed bytes are dropped only when
+/// they make up half the buffer and more arrive, so consuming small pieces
+/// does not move the rest each time.
+#[derive(Debug, Default)]
+pub struct RecvBuf {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl RecvBuf {
+    /// The bytes not consumed yet.
+    pub fn pending(&self) -> &[u8] {
+        &self.data[self.pos..]
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drops the first `n` pending bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if fewer than `n` bytes are pending.
+    pub fn consume(&mut self, n: usize) {
+        assert!(n <= self.len(), "consumed more than was received");
+        self.pos += n;
+        if self.pos == self.data.len() {
+            self.data.clear();
+            self.pos = 0;
+        }
+    }
+
+    /// Appends received bytes.
+    pub fn extend(&mut self, bytes: &[u8]) {
+        if self.pos > 0 && self.pos >= self.data.len() / 2 {
+            self.data.drain(..self.pos);
+            self.pos = 0;
+        }
+        self.data.extend_from_slice(bytes);
+    }
+}
+
+#[cfg(test)]
+mod recv_buf_tests {
+    use super::RecvBuf;
+
+    #[test]
+    fn consumes_in_order_and_compacts() {
+        let mut b = RecvBuf::default();
+        b.extend(&[1, 2, 3, 4]);
+        b.consume(1);
+        assert_eq!(b.pending(), [2, 3, 4]);
+        b.consume(2);
+        // Three of four bytes consumed: dropped before more are added.
+        b.extend(&[5, 6]);
+        assert_eq!(b.pending(), [4, 5, 6]);
+        assert_eq!((b.data.len(), b.pos), (3, 0));
+        b.consume(3);
+        assert!(b.is_empty());
+        assert_eq!(b.data.len(), 0);
+    }
+}

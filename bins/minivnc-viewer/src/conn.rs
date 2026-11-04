@@ -49,7 +49,12 @@ pub struct Screen {
     pub width: u16,
     pub height: u16,
     pub pixels: Vec<u32>,
+    /// Rectangles changed since the window last drew (at most
+    /// `MAX_DAMAGE`; beyond that, their bounding box).
+    pub damage: Vec<Rect>,
 }
+
+const MAX_DAMAGE: usize = 64;
 
 #[derive(Clone)]
 pub struct SharedScreen(Arc<Mutex<Screen>>);
@@ -61,6 +66,7 @@ impl SharedScreen {
             width,
             height,
             pixels,
+            damage: Vec::new(),
         })))
     }
 
@@ -73,6 +79,7 @@ impl SharedScreen {
             width,
             height,
             pixels: vec![0; usize::from(width) * usize::from(height)],
+            damage: Vec::new(),
         };
     }
 }
@@ -162,6 +169,15 @@ fn copy_rects(client: &Client<Stream>, rects: &[Rect], screen: &SharedScreen) {
                 *d = u32::from_le_bytes([blue, green, red, 0]);
             }
         }
+    }
+    screen.damage.extend_from_slice(rects);
+    if screen.damage.len() > MAX_DAMAGE {
+        let d = &screen.damage;
+        let (x0, y0) = (d.iter().map(|r| r.x).min(), d.iter().map(|r| r.y).min());
+        let x1 = d.iter().map(|r| r.x + r.w).max();
+        let y1 = d.iter().map(|r| r.y + r.h).max();
+        let (x0, y0, x1, y1) = (x0.unwrap(), y0.unwrap(), x1.unwrap(), y1.unwrap());
+        screen.damage = vec![Rect::new(x0, y0, x1 - x0, y1 - y0)];
     }
 }
 

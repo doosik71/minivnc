@@ -151,6 +151,44 @@ impl Framebuffer {
         Ok(())
     }
 
+    /// Copies `rect` from `src`, a framebuffer of the same size and format.
+    pub fn copy_rect_from(&mut self, src: &Framebuffer, rect: Rect) -> Result<(), CodecError> {
+        if !self.contains(rect) {
+            return Err(CodecError::RectOutOfBounds(rect));
+        }
+        if (src.width, src.height, src.format) != (self.width, self.height, self.format) {
+            return Err(CodecError::BadLength);
+        }
+        for y in 0..rect.h {
+            let row = src.rect_row(rect, y);
+            let start = self.offset(rect.x, rect.y + y);
+            self.data[start..start + row.len()].copy_from_slice(row);
+        }
+        Ok(())
+    }
+
+    /// The bytes from the first pixel of `rect` to its last, rows
+    /// [`stride`](Self::stride) apart.
+    pub fn rect_bytes(&self, rect: Rect) -> &[u8] {
+        &self.data[self.rect_span(rect)]
+    }
+
+    pub fn rect_bytes_mut(&mut self, rect: Rect) -> &mut [u8] {
+        let span = self.rect_span(rect);
+        &mut self.data[span]
+    }
+
+    fn rect_span(&self, rect: Rect) -> std::ops::Range<usize> {
+        assert!(self.contains(rect), "rectangle outside the framebuffer");
+        if rect.w == 0 || rect.h == 0 {
+            return 0..0;
+        }
+        let start = self.offset(rect.x, rect.y);
+        let end =
+            self.offset(rect.x, rect.y + rect.h - 1) + usize::from(rect.w) * self.bytes_per_pixel();
+        start..end
+    }
+
     /// Fills `rect` with one pixel value.
     pub fn fill_rect(&mut self, rect: Rect, value: u32) -> Result<(), CodecError> {
         if !self.contains(rect) {
@@ -200,6 +238,35 @@ mod tests {
         }
         assert_eq!(pack_rgb(&RGB565_BE, [255, 255, 255]), 0xFFFF);
         assert_eq!(pack_rgb(&RGB565_BE, [255, 0, 0]), 0xF800);
+    }
+
+    #[test]
+    fn copy_between_framebuffers_and_rect_bytes() {
+        let mut src = Framebuffer::new(5, 4, RGB565_BE);
+        for y in 0..4 {
+            for x in 0..5 {
+                src.fill_rect(Rect::new(x, y, 1, 1), u32::from(y * 5 + x))
+                    .unwrap();
+            }
+        }
+        let mut dst = Framebuffer::new(5, 4, RGB565_BE);
+        let r = Rect::new(1, 1, 3, 2);
+        dst.copy_rect_from(&src, r).unwrap();
+        for y in 0..4 {
+            for x in 0..5 {
+                let inside = (1..4).contains(&x) && (1..3).contains(&y);
+                let expected = if inside { src.pixel(x, y) } else { 0 };
+                assert_eq!(dst.pixel(x, y), expected, "({x}, {y})");
+            }
+        }
+        // From the first pixel of the rectangle to its last.
+        let bytes = src.rect_bytes(r);
+        assert_eq!(bytes.len(), src.stride() + 3 * 2);
+        assert_eq!(bytes[..2], [0, 6]);
+        assert_eq!(bytes[src.stride() + 4..], [0, 13]);
+        assert!(src.rect_bytes(Rect::new(4, 3, 0, 0)).is_empty());
+        let other = Framebuffer::new(4, 4, RGB565_BE);
+        assert!(dst.copy_rect_from(&other, Rect::new(0, 0, 1, 1)).is_err());
     }
 
     #[test]

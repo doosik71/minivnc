@@ -701,17 +701,33 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - **검증하지 못한 것**: 올바른 비밀번호로 PAM 로그인 성공. 사용자 비밀번호가 필요하고, `/etc/pam.d/minivnc` 설치에는 root가 필요하다.
 
 ### M7. 성능 기능 (3주)
-- [ ] **멀티스레드 Tight**
-  - 수평 띠 분할, `min(nthreads, area/MAXRECTSIZE)`
+- [x] **멀티스레드 Tight**
+  - 수평 띠 분할, `min(nthreads, area/MAXRECTSIZE)`(`-nthreads`, `-nomt`, 기본은 CPU 수, 최대 4)
   - 스레드별 zlib 스트림 분배를 원본과 같은 결정적 규칙으로 한다.
   - 출력은 순서대로 기록한다.
   - `rayon` scoped pool을 쓴다.
-- [ ] **Interframe Comparison:** 256 블록 비교, CL 5~8 자동 활성화, `-interframe`/`-nointerframe`
-- [ ] **ALR:** lossy/lossless 영역 기록, CopyRect가 lossy를 전파하도록 처리, 타이머, `-alr`/`-alrqual`/`-alrsamp`, 혼잡 제어 우회
-- [ ] 뷰어: "Lossless Refresh" 단축키(Ctrl+Alt+Shift+L)
-- [ ] `rfb-record`/`rfb-bench`: 녹화와 재생 벤치마크, 업데이트/s·Mbps·디코딩 시간 프로파일러
-- [ ] 최적화: SIMD 팔레트 탐색, 픽셀 변환, 메모리 재사용(버퍼 풀)
+  - 원본과 다른 점: LastRect를 받는 클라이언트에만 띠로 나눈다. 받지 않으면 미리 알린 사각형 수와 띠가 만든 수가 다를 수 있기 때문이다.
+- [x] **Interframe Comparison:** 256 블록 비교, `-interframe`/`-nointerframe`
+  - 자동 모드는 TurboVNC 소스대로 CL 5 이상(9 포함)에서 켜진다. 압축 레벨이 든 SetEncodings를 받을 때만 바뀐다.
+  - 바뀐 블록이 없으면 1x1 사각형을 보낸다.
+- [x] **ALR:** JPEG 영역 기록, 타이머, `-alr`/`-alrqual`/`-alrsamp`, 혼잡 제어 우회
+  - XDamage는 그리기 종류를 알려 주지 않는다. 그래서 TurboVNC의 "PutImage 영역만" 구분 없이, JPEG로 보낸 영역 전체를 다시 보낸다(TurboVNC `TVNC_ALRALL`과 같다).
+  - 서버가 CopyRect를 만들지 않으므로 CopyRect의 lossy 전파는 해당이 없다.
+- [x] 뷰어: "Lossless Refresh" 단축키(Ctrl+Alt+Shift+L). Java 뷰어처럼 무손실 SetEncodings, 전체 요청, 원래 SetEncodings를 차례로 보낸다.
+- [x] `rfb-bench`: 실시간 측정(업데이트/s·Mpixel/s·Mbit/s), `-record`/`-replay`로 녹화와 디코딩 벤치마크. 녹화 도구를 따로 두지 않고 하나로 합쳤다. 서버 `-profile`은 TurboVNC `TVNC_PROFILE`과 같은 형식에 구간 시간을 더했다.
+- [x] 최적화(측정한 병목만, 사용자 결정)
+  - Linux JPEG를 libjpeg-turbo 3 정적 빌드로 바꿨다(사용자 결정).
+  - JPEG 입력과 출력을 프레임버퍼 그 자리에서 쓰고, 핸들을 재사용한다.
+  - 팔레트 색인을 고정 크기 표로 바꿨고, 색은 서버 픽셀로 센다.
+  - X 이미지 읽기와 포인터 조회의 왕복을 묶었다.
+  - 수신 버퍼에 소비 위치를 두었고, 뷰어는 부분 표시를 한다.
+  - 정적 분석 제안의 검토와 적용 결과는 `docs/improvement-plan.md`에 있다. SIMD 팔레트 탐색과 버퍼 풀은 병목이 아니어서 하지 않았다.
 - **DoD:** §3.1의 성능 목표를 달성한다(벤치마크 결과를 `docs/bench.md`에 기록).
+- **검증 기록 (2026-11-04)**: 상세는 `docs/bench.md`에 있다.
+  - TurboVNC 3.3.1 Xvnc와 같은 부하(mpv 영상 2종, x11perf 텍스트)와 5개 프리셋에서 비교했다. 인코딩 처리량은 81~138%, 대역폭은 영상에서 0.96~1.01배, 텍스트에서 Mpixel당 1.01배였다. 두 기준을 만족한다.
+  - 남은 차이는 외부 캡처 구조에서 오는 CPU다(영상에서 Xvfb 포함 15~20% 대 Xvnc 8~14%).
+  - 녹화 재생 디코딩은 JPEG 4.15 → 2.60 ms/update, 무손실 1.68 → 1.51 ms/update로 줄었다.
+  - 루프백 테스트를 추가했다: 띠 분할 다중 프레임 왕복, JPEG 영역 보고, Interframe(설정·자동·CL), ALR 무손실 복원.
 
 ### M8. 호환성·편의 기능 (3주, P2)
 - [ ] ZRLE, Hextile 인코더/디코더(noVNC, TigerVNC, RealVNC 호환)

@@ -18,6 +18,7 @@ pub use rfb_proto::msg::Screen;
 use rfb_proto::msg::{ClientMessage, CutText, RectHeader, ServerMessage, ServerParseCtx};
 pub use rfb_proto::security::SecurityType;
 use rfb_proto::security::{Method, Tls};
+use rfb_proto::wire::RecvBuf;
 use rfb_proto::{Parsed, PixelFormat, ProtoError, Rect};
 
 mod tls;
@@ -270,7 +271,7 @@ fn cursor_shape(r: Rect, mask: &[u8], rgb: impl Fn(usize) -> [u8; 3]) -> CursorS
 /// Stream plus bytes received but not yet parsed.
 struct Conn<S> {
     stream: S,
-    buf: Vec<u8>,
+    buf: RecvBuf,
     /// Bytes read from the stream so far.
     received: u64,
 }
@@ -279,9 +280,10 @@ struct Conn<S> {
 impl<S: Read> Read for Conn<S> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if !self.buf.is_empty() {
-            let n = out.len().min(self.buf.len());
-            out[..n].copy_from_slice(&self.buf[..n]);
-            self.buf.drain(..n);
+            let pending = self.buf.pending();
+            let n = out.len().min(pending.len());
+            out[..n].copy_from_slice(&pending[..n]);
+            self.buf.consume(n);
             return Ok(n);
         }
         let n = self.stream.read(out)?;
@@ -298,14 +300,14 @@ impl<S: Read + Write> Conn<S> {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
         self.received += n as u64;
-        self.buf.extend_from_slice(&chunk[..n]);
+        self.buf.extend(&chunk[..n]);
         Ok(())
     }
 
     fn parse<T>(&mut self, parse: impl Fn(&[u8]) -> Parsed<T>) -> Result<T> {
         loop {
-            if let Some((v, n)) = parse(&self.buf)? {
-                self.buf.drain(..n);
+            if let Some((v, n)) = parse(self.buf.pending())? {
+                self.buf.consume(n);
                 return Ok(v);
             }
             self.fill()?;
@@ -322,8 +324,10 @@ impl<S: Read + Write> Conn<S> {
 
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.ensure(N)?;
-        let v = self.buf[..N].try_into().expect("N bytes buffered");
-        self.buf.drain(..N);
+        let v = self.buf.pending()[..N]
+            .try_into()
+            .expect("N bytes buffered");
+        self.buf.consume(N);
         Ok(v)
     }
 
@@ -333,7 +337,9 @@ impl<S: Read + Write> Conn<S> {
 
     fn read_vec(&mut self, n: usize) -> Result<Vec<u8>> {
         self.ensure(n)?;
-        Ok(self.buf.drain(..n).collect())
+        let v = self.buf.pending()[..n].to_vec();
+        self.buf.consume(n);
+        Ok(v)
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
@@ -537,7 +543,7 @@ impl<S: Transport> Client<S> {
     pub fn connect(stream: S, options: &ConnectOptions) -> Result<Self> {
         let mut conn = Conn {
             stream,
-            buf: Vec::new(),
+            buf: RecvBuf::default(),
             received: 0,
         };
         let offered = conn.parse(Version::parse)?;
@@ -681,8 +687,8 @@ impl<S: Read + Write> Client<S> {
                 ENCODING_RAW => {
                     let len = raw::payload_len(header.rect, self.fb.format());
                     self.conn.ensure(len)?;
-                    raw::decode(&mut self.fb, header.rect, &self.conn.buf[..len])?;
-                    self.conn.buf.drain(..len);
+                    raw::decode(&mut self.fb, header.rect, &self.conn.buf.pending()[..len])?;
+                    self.conn.buf.consume(len);
                     changed.push(header.rect);
                 }
                 // Only reachable with num_rects == 0xFFFF.

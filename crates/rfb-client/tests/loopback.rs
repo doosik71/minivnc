@@ -1307,3 +1307,39 @@ fn automatic_lossless_refresh_replaces_jpeg() {
     assert!(area(&refresh) >= 64 * 48);
     assert!(noise_exact(&client));
 }
+
+/// The viewer's lossless refresh (TurboVNC `CConn.losslessRefresh`):
+/// lossless encodings, a full request, then the lossy ones again, sent
+/// together; the server answers the request before the encodings change.
+#[test]
+fn lossless_refresh_sequence() {
+    let addr = start_with(Pattern, no_auth(Config::default()), None);
+    let mut client = connect(addr, None).unwrap();
+    let jpeg = [
+        ENCODING_TIGHT,
+        ENCODING_LAST_RECT,
+        ENCODING_COMPRESS_LEVEL0 + 1,
+        ENCODING_FINE_QUALITY_LEVEL0 + 30,
+        ENCODING_SUBSAMP_2X,
+    ];
+    let noise_exact = |c: &Client<Stream>| {
+        (0..64).all(|x| {
+            (0..48).all(|y| c.framebuffer().pixel(x, y) == pack_rgb(&RGB888, pattern_rgb(x, y)))
+        })
+    };
+    client.set_encodings(&jpeg).unwrap();
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    next_update(&mut client);
+    assert!(!noise_exact(&client));
+
+    let lossless = [
+        ENCODING_TIGHT,
+        ENCODING_LAST_RECT,
+        ENCODING_COMPRESS_LEVEL0 + 1,
+    ];
+    client.set_encodings(&lossless).unwrap();
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    client.set_encodings(&jpeg).unwrap();
+    next_update(&mut client);
+    assert!(noise_exact(&client));
+}

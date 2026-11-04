@@ -567,16 +567,15 @@ fn read_all(source: &mut impl FrameSource) -> io::Result<Framebuffer> {
 /// Copies `region` (inside both) from `src` to `dst`.
 fn copy_region(dst: &mut Framebuffer, src: &Framebuffer, region: &Region) {
     for r in region.rects() {
-        let r = source::to_wire_rect(r);
-        let mut rows = Vec::with_capacity(r.area() as usize * src.bytes_per_pixel());
-        for y in 0..r.h {
-            rows.extend_from_slice(src.rect_row(r, y));
-        }
-        dst.put_rect(r, &rows).expect("same size framebuffers");
+        dst.copy_rect_from(src, source::to_wire_rect(r))
+            .expect("same size framebuffers");
     }
 }
 
 fn capture_loop(mut source: impl FrameSource, shared: Weak<Shared>) {
+    // `-profile`: changes applied, and the time spent applying them (most
+    // of it with the screen locked for writing).
+    let (mut since, mut applied, mut busy) = (Instant::now(), 0u32, Duration::ZERO);
     loop {
         let changes = match source.wait_changes(CAPTURE_POLL) {
             Ok(c) => c,
@@ -591,9 +590,23 @@ fn capture_loop(mut source: impl FrameSource, shared: Weak<Shared>) {
         if changes.is_empty() {
             continue;
         }
+        let started = Instant::now();
         if let Err(e) = apply(&mut source, &shared, changes) {
             error!("frame source read failed: {e}");
             return;
+        }
+        if shared.config.profile {
+            applied += 1;
+            busy += started.elapsed();
+            let elapsed = since.elapsed();
+            if elapsed >= Duration::from_secs(5) {
+                info!(
+                    "capture: {:.2} changes/sec, {:.3} ms each to read and apply",
+                    f64::from(applied) / elapsed.as_secs_f64(),
+                    busy.as_secs_f64() * 1000.0 / f64::from(applied),
+                );
+                (since, applied, busy) = (Instant::now(), 0, Duration::ZERO);
+            }
         }
     }
 }

@@ -6,7 +6,7 @@
 //! the window when the server allows. Whenever the window is smaller,
 //! scroll bars appear; dragging them pans the view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -19,12 +19,13 @@ use rfb_proto::Rect;
 use rfb_proto::consts::{EDS_REASON_CLIENT, LED_CAPS_LOCK, LED_NUM_LOCK, LED_SCROLL_LOCK};
 use rfb_proto::msg::{ClientMessage, Screen as ScreenDesc};
 use softbuffer::Surface;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
 use crate::conn::{self, Notice, SharedClipboard, SharedScreen, Writer};
@@ -92,6 +93,35 @@ fn layout(window: (u32, u32), remote: (u32, u32)) -> Layout {
     l
 }
 
+/// What a presented frame showed: a later frame may redraw only changed
+/// pixels if it shows the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shown {
+    window: (usize, usize),
+    offset: (usize, usize),
+    layout: Layout,
+    remote: (usize, usize),
+}
+
+/// How many frames' damage is kept for buffers presented that long ago.
+const DAMAGE_HISTORY: usize = 3;
+
+/// The part of remote rectangle `r` the window shows, as remote
+/// coordinates `(x0, y0, x1, y1)`.
+fn visible(r: Rect, s: &Shown) -> Option<(usize, usize, usize, usize)> {
+    let (ox, oy) = s.offset;
+    let (vw, vh) = (s.layout.view.0 as usize, s.layout.view.1 as usize);
+    let x0 = usize::from(r.x).max(ox);
+    let y0 = usize::from(r.y).max(oy);
+    let x1 = (usize::from(r.x) + usize::from(r.w))
+        .min(ox + vw)
+        .min(s.remote.0);
+    let y1 = (usize::from(r.y) + usize::from(r.h))
+        .min(oy + vh)
+        .min(s.remote.1);
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
 /// Thumb start and length along a bar of `track` pixels.
 fn thumb(track: u32, view: u32, remote: u32, offset: u32) -> (u32, u32) {
     let len = (u64::from(track) * u64::from(view) / u64::from(remote.max(1))).max(8) as u32;
@@ -132,6 +162,13 @@ struct App {
     encodings: Vec<i32>,
     lossless_encodings: Option<Vec<i32>>,
     modifiers: ModifiersState,
+    /// The platform keeps presented pixels (not plain X11, where uncovered
+    /// parts of the window must be drawn again).
+    partial_redraw: bool,
+    /// The last frame presented, and the damage each recent frame drew
+    /// (newest first; `None` for a full redraw).
+    shown: Option<Shown>,
+    history: VecDeque<Option<Vec<Rect>>>,
     /// Server extensions confirmed so far.
     qemu_keys: bool,
     ext_mouse_buttons: bool,
@@ -373,8 +410,58 @@ impl App {
         let (ox, oy) = (self.offset.0 as usize, self.offset.1 as usize);
         // The screen may already have a new size the window has not heard
         // of yet; it is what gets drawn.
-        let screen = self.screen.lock();
+        let mut screen = self.screen.lock();
         let (rw, rh) = (usize::from(screen.width), usize::from(screen.height));
+        let damage = std::mem::take(&mut screen.damage);
+        let shown = Shown {
+            window: (w, h),
+            offset: (ox, oy),
+            layout: l,
+            remote: (rw, rh),
+        };
+
+        // Only the changed pixels, if the buffer holds an earlier frame of
+        // the same view and the changes since then are known.
+        let age = usize::from(buf.age());
+        let since = age.saturating_sub(1);
+        if self.partial_redraw
+            && !self.connbar
+            && self.shown == Some(shown)
+            && age >= 1
+            && since <= self.history.len()
+            && self.history.iter().take(since).all(Option::is_some)
+        {
+            let older = self.history.iter().take(since).flatten().flatten();
+            let mut presented = Vec::new();
+            for &r in damage.iter().chain(older) {
+                let Some((x0, y0, x1, y1)) = visible(r, &shown) else {
+                    continue;
+                };
+                for y in y0..y1 {
+                    let row = (y - oy) * w;
+                    buf[row + x0 - ox..row + x1 - ox]
+                        .copy_from_slice(&screen.pixels[y * rw + x0..y * rw + x1]);
+                }
+                presented.push(softbuffer::Rect {
+                    x: (x0 - ox) as u32,
+                    y: (y0 - oy) as u32,
+                    width: NonZeroU32::new((x1 - x0) as u32).expect("not empty"),
+                    height: NonZeroU32::new((y1 - y0) as u32).expect("not empty"),
+                });
+            }
+            drop(screen);
+            self.history.push_front(Some(damage));
+            self.history.truncate(DAMAGE_HISTORY);
+            trace!(rects = presented.len(), "partial redraw");
+            return buf.present_with_damage(&presented);
+        }
+        if self.shown != Some(shown) {
+            self.shown = Some(shown);
+            self.history.clear();
+        }
+        self.history.push_front(None);
+        self.history.truncate(DAMAGE_HISTORY);
+
         let vthumb = thumb(l.view.1, l.view.1, self.remote.1, self.offset.1);
         let hthumb = thumb(l.view.0, l.view.0, self.remote.0, self.offset.0);
         for (y, row) in buf.chunks_exact_mut(w).take(h).enumerate() {
@@ -586,6 +673,10 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        self.partial_redraw = !matches!(
+            window.window_handle().map(|h| h.as_raw()),
+            Ok(RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_))
+        );
         let surface = softbuffer::Context::new(Rc::clone(&window))
             .and_then(|context| Surface::new(&context, Rc::clone(&window)));
         match surface {
@@ -835,6 +926,9 @@ pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(),
         dragging: None,
         pressed: HashMap::new(),
         wheel: (0.0, 0.0),
+        partial_redraw: false,
+        shown: None,
+        history: VecDeque::new(),
         encodings: app_encodings,
         lossless_encodings,
         modifiers: ModifiersState::empty(),
@@ -858,6 +952,31 @@ pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_part_of_damage() {
+        let shown = Shown {
+            window: (100, 80),
+            offset: (10, 20),
+            layout: Layout {
+                view: (90, 70),
+                hbar: true,
+                vbar: true,
+            },
+            remote: (200, 150),
+        };
+        // Clipped to the view, which shows remote (10, 20)-(100, 90).
+        assert_eq!(
+            visible(Rect::new(0, 0, 50, 50), &shown),
+            Some((10, 20, 50, 50))
+        );
+        assert_eq!(
+            visible(Rect::new(95, 85, 30, 30), &shown),
+            Some((95, 85, 100, 90))
+        );
+        assert_eq!(visible(Rect::new(100, 0, 5, 5), &shown), None);
+        assert_eq!(visible(Rect::new(0, 0, 10, 100), &shown), None);
+    }
 
     #[test]
     fn layout_adds_bars_as_needed() {

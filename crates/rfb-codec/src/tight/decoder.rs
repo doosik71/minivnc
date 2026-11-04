@@ -10,12 +10,14 @@ use rfb_proto::{PixelFormat, Rect};
 
 use super::{MIN_TO_COMPRESS, unpack24, uses_tpixel};
 use crate::framebuffer::{Framebuffer, pack_rgb, read_pixel, write_pixel};
-use crate::{DecodeError, jpeg};
+use crate::jpeg::{JpegDecompressor, Layout};
+use crate::{CodecError, DecodeError};
 
 /// Decoder state: the four zlib streams persist across rectangles.
 #[derive(Default)]
 pub struct TightDecoder {
     streams: [Option<Decompress>; 4],
+    jpeg: JpegDecompressor,
 }
 
 fn invalid(what: &'static str) -> DecodeError {
@@ -94,7 +96,18 @@ impl TightDecoder {
         if ctl == TIGHT_JPEG {
             let len = read_compact_len(r)?;
             let data = read_bytes(r, len)?;
-            let rgb = jpeg::decompress(&data, rect.w, rect.h)?;
+            // 32bpp framebuffers are written in place.
+            if let Some(layout) = Layout::of(&format) {
+                if !fb.contains(rect) {
+                    return Err(CodecError::RectOutOfBounds(rect).into());
+                }
+                let pitch = fb.stride();
+                let out = fb.rect_bytes_mut(rect);
+                return Ok(self
+                    .jpeg
+                    .decompress_into(&data, rect.w, rect.h, out, layout, pitch)?);
+            }
+            let rgb = self.jpeg.decompress(&data, rect.w, rect.h)?;
             let mut pixels = Vec::with_capacity(w * h * bpp);
             for p in rgb.as_chunks::<3>().0 {
                 write_pixel(
