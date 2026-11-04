@@ -35,11 +35,15 @@ fn refused(reason: &str) -> io::Error {
 
 /// Runs the handshake up to `ServerInit`. Returns the access granted and
 /// whether the client asked to share the desktop.
+/// `reverse`: the server connected to a listening viewer, which gets no
+/// X509 security types (TurboVNC: the viewer cannot have the server's
+/// certificate checked the usual way).
 pub(crate) async fn run(
     conn: &mut Conn,
     shared: &Shared,
     id: u64,
     peer: IpAddr,
+    reverse: bool,
 ) -> io::Result<(Access, bool)> {
     conn.write(&Version::V3_8.to_bytes()).await?;
     let asked = conn.parse(Version::parse).await?;
@@ -54,7 +58,15 @@ pub(crate) async fn run(
         "using protocol version {}.{}", version.major, version.minor
     );
 
+    let types = shared
+        .config
+        .security_types
+        .iter()
+        .copied()
+        .filter(|t| !reverse || t.tls() != Some(Tls::X509))
+        .collect();
     let mut h = Handshake {
+        types,
         conn,
         shared,
         id,
@@ -156,11 +168,13 @@ struct Handshake<'a> {
     version: Version,
     /// The client chose the Tight security type.
     tight: bool,
+    /// The security types this client may use.
+    types: Vec<SecurityType>,
 }
 
 impl Handshake<'_> {
     fn enabled(&self) -> &[SecurityType] {
-        &self.shared.config.security_types
+        &self.types
     }
 
     /// `rfbClientConnFailed`: refused before authentication.

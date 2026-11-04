@@ -34,7 +34,9 @@ impl Contexts {
         } else {
             None
         };
-        let x509 = if types.iter().any(|t| t.tls() == Some(Tls::X509)) {
+        // Also for secure WebSockets whenever a certificate is given.
+        let x509 = if types.iter().any(|t| t.tls() == Some(Tls::X509)) || config.x509_cert.is_some()
+        {
             let cert = config.x509_cert.as_deref().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -47,6 +49,11 @@ impl Contexts {
             None
         };
         Ok(Self { anon, x509 })
+    }
+
+    /// An X.509 certificate is configured (needed for secure WebSockets).
+    pub fn has_x509(&self) -> bool {
+        self.x509.is_some()
     }
 
     /// Runs the server side of the TLS handshake on `stream`.

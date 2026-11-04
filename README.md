@@ -82,15 +82,63 @@ cargo build --release
 cargo build --release --workspace --features rfb-codec/turbojpeg   # Windows에서 libjpeg-turbo 사용
 ```
 
-## 현재 시험해 볼 수 있는 것 (M7)
+빌드 결과는 `target/release/`에 생깁니다(`minivnc-server`, `minivnc-viewer`, `minivnc-passwd`, `minivnc-session`, `rfb-snapshot`, `rfb-bench`; Windows는 `.exe`).
+
+### 설치
+
+`cargo install`로 실행 파일을 `~/.cargo/bin`(Windows는 `%USERPROFILE%\.cargo\bin`)에 설치합니다. 이 디렉터리가 PATH에 있어야 합니다.
+
+```sh
+# Linux: 서버, 세션 관리, 비밀번호 도구, 뷰어
+for p in minivnc-server minivnc-session minivnc-passwd minivnc-viewer; do
+    cargo install --locked --path bins/$p
+done
+
+# Windows: 뷰어와 비밀번호 도구. cargo install은 임시 디렉터리에서 빌드하므로
+# OpenSSL 경로 문제를 피하려면 짧은 --target-dir를 준다.
+cargo install --locked --target-dir C:\t --path bins/minivnc-viewer
+cargo install --locked --target-dir C:\t --path bins/minivnc-passwd
+
+# 선택: 시험·측정 도구
+cargo install --locked --path tools/rfb-snapshot
+cargo install --locked --path tools/rfb-bench
+
+# 제거
+cargo uninstall minivnc-viewer
+```
+
+`minivnc-session`은 같은 디렉터리의 `minivnc-server`, `minivnc-passwd`를 먼저 찾으므로 함께 설치합니다. Xvfb와 xauth는 시스템 패키지로 설치합니다(Debian/Ubuntu: `sudo apt install xvfb xauth`; 기본 데스크톱은 `xfce4 dbus-x11`).
+
+### 실행
+
+```sh
+# Linux 서버 쪽: 비밀번호를 정하고(~/.vnc/passwd) 세션을 시작한다
+minivnc-passwd
+minivnc-session -geometry 1920x1080     # "started on display HOST:1"이면 포트 5901
+minivnc-session -list
+minivnc-session -kill :1
+
+# 뷰어 쪽(Windows/Linux): 디스플레이 번호 또는 ::포트로 접속한다
+minivnc-viewer myhost:1
+minivnc-viewer myhost::5901 -Scale=Auto
+```
+
+TurboVNC 뷰어로도 같은 주소에 접속할 수 있습니다. 서버와 뷰어의 전체 옵션은 `-help`로 볼 수 있고, 예시는 아래에 있습니다.
+
+## 현재 시험해 볼 수 있는 것 (M8)
 
 ```sh
 # 비밀번호 파일 생성 (TurboVNC vncpasswd -f와 같은 출력)
 echo secret12 | minivnc-passwd -f > passwd
 
-# Linux: Xvfb + xfce4 세션을 한 번에 띄우는 스크립트 (포트 5901, 최대 5120x1440).
-# TurboVNC vncserver처럼 로그오프하거나 Ctrl+C를 누르면 세션 전체가 끝난다.
-scripts/start-minivnc-server.sh -n 1 -g 5120x1440 -p ~/.vnc/passwd
+# Linux: TurboVNC vncserver처럼 Xvfb + 서버 + 데스크톱(~/.vnc/xstartup.minivnc,
+# 없으면 xfce4로 만든다)을 빈 디스플레이 번호에 띄운다. 비밀번호는 ~/.vnc/passwd
+# (없으면 minivnc-passwd를 실행한다). 로그오프하면 세션 전체가 끝난다.
+minivnc-session -geometry 5120x1440            # 백그라운드, 로그 ~/.vnc/HOST:N.log
+minivnc-session :2 -fg -otp -- -localhost      # 포그라운드(Ctrl+C로 끝), OTP 출력
+minivnc-session -list
+minivnc-session -kill :1                       # -kill :*: 모두
+scripts/start-minivnc-server.sh -n 1 -g 5120x1440   # minivnc-session -fg 래퍼
 
 # 같은 일을 손으로 할 때 (포트 5901)
 # (WSLg에서는 GTK 앱이 Wayland로 가지 않도록 WAYLAND_DISPLAY를 지운다.
@@ -116,6 +164,12 @@ minivnc-passwd -o -display :1      # -v: view-only OTP도, -c: 지우기
 #   -interframe / -nointerframe (기본: CL 5 이상에서 켬),
 #   -alr SECS [-alrqual Q] [-alrsamp 1X|2X|4X|Gray] (JPEG 영역 무손실 재전송),
 #   -profile (5초마다 업데이트·인코딩·캡처 통계)
+# 인코딩: Tight, ZRLE, Hextile, Raw (클라이언트가 고른 것). 같은 포트에서
+#   WebSocket(ws://, noVNC 등)도 받는다. 인증서(-x509cert)가 있으면 wss://도.
+# 역방향 연결: 리슨 중인 뷰어에 먼저 접속한다(기본 포트 5500, 반복 가능).
+#   #ID는 UltraVNC repeater의 ID:n이다.
+minivnc-server :1 -display :1 -rfbauth passwd -connect viewerhost
+minivnc-server :1 -display :1 -rfbauth passwd -connect repeater:5500#1234
 
 # 테스트 화면 서버(모든 플랫폼): 움직이는 패턴 또는 PNG 파일/디렉터리, 포트 5902
 minivnc-server :2 -rfbauth passwd -source pattern -geometry 800x600
@@ -129,13 +183,26 @@ minivnc-viewer myhost::5901 -JPEG=0 -CompressLevel=0   # 무손실
 #   없으면 콘솔에서 묻고, 수락한 인증서는 ~/.vnc/x509_savedcerts.pem에 저장한다.
 minivnc-viewer myhost:1 -SecurityTypes=X509Vnc -X509CA=ca.pem
 minivnc-viewer myhost:1 -User=alice                  # Unix Login / Plain
-# 그 밖의 옵션: -Password=PW, -Encoding=Tight|Raw, -Shared=0, -ViewOnly,
-#   -DesktopSize=Auto|Server (Auto: 창 크기에 맞춰 원격 화면 크기를 바꾼다)
+# 그 밖의 옵션: -Password=PW, -Encoding=Tight|ZRLE|Hextile|Raw, -Shared=0,
+#   -ViewOnly, -DesktopSize=Auto|Server (Auto: 창 크기에 맞춰 원격 화면 크기를 바꾼다)
+# 스케일: -Scale=50 (10~400%), -Scale=Auto (창에 맞춤), -Scale=FixedRatio
+#   (비율 유지). 100이 아니면 DesktopSize는 Server가 된다.
+# 전체 화면: -Span=Primary|All|Auto (All: 모든 모니터에 걸친다. Auto: 원격
+#   화면이 한 모니터보다 크면 All)
+# 키보드 그랩(Windows, Alt+Tab·Win 키 등을 원격으로): -GrabKeyboard=FS|Always|Manual
+#   (FS: 전체 화면일 때). Ctrl+Alt+Shift+G: 그랩 켜고 끄기.
 # 최대화 버튼: 전체 화면. 위쪽 가장자리 가운데에 마우스를 대면
 #   최소화·복원·닫기 바가 나타난다. Ctrl+Alt+Shift+L: 무손실 새로 고침 요청.
+# SSH 터널: 시스템 ssh로 게이트웨이를 거친다(호스트는 게이트웨이에서 본 이름).
+minivnc-viewer -via user@gateway localhost:1
+# 역방향 연결을 기다린다(기본 포트 5500).
+minivnc-viewer -listen
+# 연결 정보 파일(TurboVNC .turbovnc 형식). ~/.vnc/default.turbovnc는 기본값이다.
+minivnc-viewer myhost:1 -Scale=Auto -SaveConfig=work.turbovnc   # 저장(비밀번호 제외)
+minivnc-viewer work.turbovnc                                     # 또는 -config work.turbovnc
 
 # 아무 VNC 서버에 접속해 화면을 PNG로 저장하고 받은 바이트 수를 출력
-# (프리셋: lossless, lossless-zlib, perceptual, medium, low, raw)
+# (프리셋: lossless, lossless-zlib, perceptual, medium, low, zrle, hextile, raw)
 rfb-snapshot -passwd passwd -preset medium localhost:2 screen.png
 
 # 서버 처리량 측정(업데이트/s, Mpixel/s, Mbit/s)과 녹화·디코딩 재생
@@ -145,18 +212,7 @@ rfb-bench -replay session.rfb
 # TurboVNC와 같은 부하로 비교하는 방법과 결과: docs/bench.md
 ```
 
-## 사용 예 (예정)
-
-```sh
-# 비밀번호 파일 생성 (TurboVNC ~/.vnc/passwd 형식과 호환)
-minivnc-passwd ~/.vnc/passwd
-
-# 헤드리스 세션 시작 (Xvfb :1 + 서버, 포트 5901)
-minivnc-session -geometry 1920x1080
-
-# 기존 X 디스플레이 공유
-minivnc-server -display :0 -rfbport 5900 -rfbauth ~/.vnc/passwd
-```
+기존 X 디스플레이를 공유하려면 `minivnc-server -display :0 -rfbport 5900 -rfbauth ~/.vnc/passwd`처럼 실행합니다.
 
 ## 로드맵
 

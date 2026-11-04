@@ -73,6 +73,10 @@ usage: minivnc-server [:N] [options]
   -alrqual Q            send the refresh as JPEG of quality Q (1-100) instead
   -alrsamp S            its chroma subsampling: 1X (default), 2X, 4X, Gray
   -profile              log update statistics every 5 seconds
+  -connect HOST[:PORT][#ID]
+                        also connect to a viewer listening on HOST (port 5500
+                        by default), through an UltraVNC repeater if ID is
+                        given; may be repeated
   -noremoteresize       do not let viewers resize the desktop
   -maxclipboard BYTES   clipboard transfer limit (default 1048576)
   -noclipboardsend      do not send the desktop clipboard to viewers
@@ -111,6 +115,8 @@ struct Options {
     alr_quality: Option<u8>,
     alr_subsampling: Subsampling,
     profile: bool,
+    /// `-connect` targets.
+    connect: Vec<String>,
     remote_resize: bool,
     max_clipboard: usize,
     clipboard_send: bool,
@@ -152,6 +158,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         alr_quality: None,
         alr_subsampling: Subsampling::S444,
         profile: false,
+        connect: Vec::new(),
         remote_resize: true,
         max_clipboard: config.max_clipboard,
         clipboard_send: true,
@@ -258,6 +265,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
                 };
             }
             "profile" => opts.profile = true,
+            "connect" => opts.connect.push(value(&arg)?),
             "noremoteresize" => opts.remote_resize = false,
             "maxclipboard" => {
                 opts.max_clipboard = value(&arg)?.parse().map_err(|_| "bad -maxclipboard")?
@@ -412,6 +420,15 @@ async fn run(opts: Options) -> std::io::Result<()> {
     };
     let listener = TcpListener::bind(SocketAddr::from((ip, opts.port))).await?;
     info!("listening on {}", listener.local_addr()?);
+    if !opts.connect.is_empty() && conf.no_reverse_connections {
+        warn!("reverse connections are disabled (no-reverse-connections)");
+    } else {
+        for target in &opts.connect {
+            if let Err(e) = server.connect(target).await {
+                warn!("cannot connect to {target}: {e}");
+            }
+        }
+    }
     server.serve(listener).await
 }
 

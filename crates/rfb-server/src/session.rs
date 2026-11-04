@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use rfb_auth::Access;
 use rfb_codec::tight::{TightEncoder, TightSettings};
-use rfb_codec::{Framebuffer, Translator, clipboard, raw};
+use rfb_codec::zrle::ZrleEncoder;
+use rfb_codec::{Framebuffer, Translator, clipboard, hextile, raw};
 use rfb_proto::consts::*;
 use rfb_proto::msg::{
     ClientMessage, ClientParseCtx, CutText, RectHeader, Screen as ScreenDesc, ServerMessage,
@@ -25,7 +26,7 @@ use tracing::{debug, info, trace};
 use crate::encodings::EncodingPrefs;
 use crate::flow::Congestion;
 use crate::source::{to_region_rect, to_wire_rect};
-use crate::{InputEvent, Shared, Update, cursor, handshake};
+use crate::{InputEvent, Shared, Update, cursor, handshake, websocket};
 
 /// TurboVNC `rfbCombineRect`: send the bounding box instead of more
 /// rectangles than this.
@@ -100,21 +101,29 @@ impl Profile {
     }
 }
 
+/// `reverse`: the server connected to a listening viewer.
 pub(crate) async fn run(
     stream: TcpStream,
     peer: IpAddr,
     shared: Arc<Shared>,
     id: u64,
     kick: Arc<Notify>,
+    reverse: bool,
 ) {
-    let mut conn = Conn::new(Box::new(stream));
     let result = async {
-        let handshake = handshake::run(&mut conn, &shared, id, peer);
+        // A viewer we connected to speaks RFB.
+        let stream: Box<dyn Stream> = if reverse {
+            Box::new(stream)
+        } else {
+            websocket::accept(stream, &shared.tls, id).await?
+        };
+        let mut conn = Conn::new(stream);
+        let handshake = handshake::run(&mut conn, &shared, id, peer, reverse);
         let (access, wants_shared) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
         // As in TurboVNC, the sharing policy is applied after ServerInit.
-        if !shared.admit(id, wants_shared) {
+        if !shared.admit(id, wants_shared || reverse) {
             return Ok(());
         }
         Session::new(conn, &shared, id, access)?.run(&kick).await
@@ -263,6 +272,7 @@ struct Session<'a> {
     congestion_deadline: Option<tokio::time::Instant>,
     congestion: Congestion,
     tight: TightEncoder,
+    zrle: ZrleEncoder,
     /// A copy of what the client was last sent, for interframe comparison;
     /// `first_compare` makes the next comparison find everything changed.
     compare: Option<Framebuffer>,
@@ -324,6 +334,7 @@ impl<'a> Session<'a> {
             congestion_deadline: None,
             congestion: Congestion::new(Instant::now()),
             tight: TightEncoder::with_threads(shared.config.encoder_threads),
+            zrle: ZrleEncoder::new(),
             compare: None,
             first_compare: false,
             lossy: Region::new(),
@@ -1122,11 +1133,12 @@ impl<'a> Session<'a> {
                 pseudo_rect(&mut out, Rect::default(), ENCODING_EXTENDED_MOUSE_BUTTONS);
             }
             for &r in &rects {
-                if tight {
-                    self.tight
-                        .encode(fb, r, &self.translator, &settings, &mut out)
-                } else {
-                    raw::encode(fb, r, &self.translator, &mut out)
+                let t = &self.translator;
+                match self.prefs.preferred {
+                    ENCODING_TIGHT => self.tight.encode(fb, r, t, &settings, &mut out),
+                    ENCODING_ZRLE => self.zrle.encode(fb, r, t, &mut out),
+                    ENCODING_HEXTILE => hextile::encode(fb, r, t, &mut out),
+                    _ => raw::encode(fb, r, t, &mut out),
                 }
                 .map_err(io::Error::other)?;
             }

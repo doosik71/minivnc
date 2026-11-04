@@ -28,11 +28,11 @@ M7(성능 기능)의 완료 기준을 확인한 측정이다.
 
 ### 2.2 부하
 
-| 이름 | 내용 |
-| --- | --- |
-| mandel | mpv가 1280x720, 30fps의 망델브로 확대 영상을 재생한다(화면 전체가 매 프레임 바뀌는 사진형 화면). |
+| 이름    | 내용                                                                                              |
+| ------- | ------------------------------------------------------------------------------------------------- |
+| mandel  | mpv가 1280x720, 30fps의 망델브로 확대 영상을 재생한다(화면 전체가 매 프레임 바뀌는 사진형 화면).  |
 | testsrc | mpv가 1280x720, 30fps의 ffmpeg `testsrc2`를 재생한다(색 막대, 그라데이션, 글자가 섞인 합성 화면). |
-| term | `x11perf -ftext`가 코어 글꼴 텍스트를 계속 그린다(작은 변경이 많은 텍스트 화면, X 서버 CPU 포화). |
+| term    | `x11perf -ftext`가 코어 글꼴 텍스트를 계속 그린다(작은 변경이 많은 텍스트 화면, X 서버 CPU 포화). |
 
 영상은 ffmpeg로 만든 20초짜리 결정적 파일이며, 만드는 명령은 `scripts/bench-compare.sh` 머리말에 있다.
 
@@ -62,20 +62,20 @@ done
 
 ### 3.1 서버 (TurboVNC 3.3.1 대비)
 
-| 부하 | 프리셋 | 처리량 | 대역폭 | 서버 CPU (MiniVNC / TurboVNC) |
-| --- | --- | --- | --- | --- |
-| mandel | perceptual (Q95, 1X, CL1) | 106% | 0.97 | 20% / 14% |
-| mandel | medium (Q80, 2X, CL6) | 89% | 0.98 | 17% / 10% |
-| mandel | low (Q30, 4X, CL7) | 100% | 0.97 | 15% / 10% |
-| mandel | lossless (CL0) | 86% (쓰기 제외 119%) | 1.00 | 16% / 8% |
-| mandel | lossless-zlib (CL6) | 138% | 1.00 | 83% / 103% |
-| testsrc | perceptual | 121% | 0.96 | 17% / 12% |
-| testsrc | medium | 104% | 0.99 | 16% / 11% |
-| testsrc | low | 106% | 1.00 | 18% / 13% |
-| testsrc | lossless | 95% | 1.00 | 17% / 11% |
-| testsrc | lossless-zlib | 131% | 1.01 | 42% / 40% |
-| term | perceptual | 83% | Mpixel당 1.01 | 106% / 100% |
-| term | lossless | 81% | Mpixel당 1.01 | 105% / 100% |
+| 부하    | 프리셋                    | 처리량               | 대역폭        | 서버 CPU (MiniVNC / TurboVNC) |
+| ------- | ------------------------- | -------------------- | ------------- | ----------------------------- |
+| mandel  | perceptual (Q95, 1X, CL1) | 106%                 | 0.97          | 20% / 14%                     |
+| mandel  | medium (Q80, 2X, CL6)     | 89%                  | 0.98          | 17% / 10%                     |
+| mandel  | low (Q30, 4X, CL7)        | 100%                 | 0.97          | 15% / 10%                     |
+| mandel  | lossless (CL0)            | 86% (쓰기 제외 119%) | 1.00          | 16% / 8%                      |
+| mandel  | lossless-zlib (CL6)       | 138%                 | 1.00          | 83% / 103%                    |
+| testsrc | perceptual                | 121%                 | 0.96          | 17% / 12%                     |
+| testsrc | medium                    | 104%                 | 0.99          | 16% / 11%                     |
+| testsrc | low                       | 106%                 | 1.00          | 18% / 13%                     |
+| testsrc | lossless                  | 95%                  | 1.00          | 17% / 11%                     |
+| testsrc | lossless-zlib             | 131%                 | 1.01          | 42% / 40%                     |
+| term    | perceptual                | 83%                  | Mpixel당 1.01 | 106% / 100%                   |
+| term    | lossless                  | 81%                  | Mpixel당 1.01 | 105% / 100%                   |
 
 - lossless 두 행은 4.1의 마지막 수정 뒤에 다시 측정한 값이다(두 번의 평균).
 - **term의 중간 프리셋**: medium·low·lossless-zlib는 CL 5 이상이라 Interframe 비교가 켜진다. x11perf는 같은 글자를 다시 그리므로 거의 모든 픽셀이 걸러진다(초당 0.1~0.8 Mpixel). 이때 갱신 수는 MiniVNC가 초당 101회, TurboVNC가 69~74회였고, 전송량은 둘 다 0.1 Mbit/s 미만이었다.
@@ -86,9 +86,9 @@ done
 
 MiniVNC 서버에서 `rfb-bench -record`로 10초씩 녹화하고, 개선 전 커밋과 개선 후 빌드의 `rfb-bench -replay`로 각각 3번 재생했다(Linux, libjpeg-turbo).
 
-| 녹화 | 개선 전 | 개선 후 |
-| --- | --- | --- |
-| mandel perceptual (JPEG, 329 업데이트) | 4.15 ms/update, 204 Mpixel/s | 2.60 ms/update, 326 Mpixel/s |
+| 녹화                                    | 개선 전                      | 개선 후                      |
+| --------------------------------------- | ---------------------------- | ---------------------------- |
+| mandel perceptual (JPEG, 329 업데이트)  | 4.15 ms/update, 204 Mpixel/s | 2.60 ms/update, 326 Mpixel/s |
 | testsrc lossless (무손실, 354 업데이트) | 1.68 ms/update, 468 Mpixel/s | 1.51 ms/update, 521 Mpixel/s |
 
 - 재생에는 창 렌더링이 포함되지 않는다.
@@ -100,14 +100,14 @@ MiniVNC 서버에서 `rfb-bench -record`로 10초씩 녹화하고, 개선 전 �
 
 모두 mandel perceptual(MiniVNC) 기준이며, 텍스트는 term lossless다.
 
-| 단계 | 인코딩 (ms/Mpixel, 쓰기 포함) | 텍스트 갱신 (초당) |
-| --- | --- | --- |
-| M7 기능 구현 직후(순수 Rust JPEG) | 4.44 | 5.7 |
-| JPEG 입력 무변환 + jpeg-encoder AVX2 | 3.63 | — |
-| Linux libjpeg-turbo 3 | 1.76 | — |
-| X 이미지 읽기 파이프라이닝(손상 이벤트 `NON_EMPTY`) | — | 68 |
-| 팔레트 색인 교체(무손실 testsrc 45% → 92%) | — | — |
-| `improvement-plan.md` 3.2 적용(stride, 핸들 재사용, 서버 픽셀 색 계산, 포인터 조회 등) | 1.41 | 101 |
+| 단계                                                                                   | 인코딩 (ms/Mpixel, 쓰기 포함) | 텍스트 갱신 (초당) |
+| -------------------------------------------------------------------------------------- | ----------------------------- | ------------------ |
+| M7 기능 구현 직후(순수 Rust JPEG)                                                      | 4.44                          | 5.7                |
+| JPEG 입력 무변환 + jpeg-encoder AVX2                                                   | 3.63                          | —                  |
+| Linux libjpeg-turbo 3                                                                  | 1.76                          | —                  |
+| X 이미지 읽기 파이프라이닝(손상 이벤트 `NON_EMPTY`)                                    | —                             | 68                 |
+| 팔레트 색인 교체(무손실 testsrc 45% → 92%)                                             | —                             | —                  |
+| `improvement-plan.md` 3.2 적용(stride, 핸들 재사용, 서버 픽셀 색 계산, 포인터 조회 등) | 1.41                          | 101                |
 
 - 기준 프로파일: 기능 구현 직후 시간의 75%가 순수 Rust JPEG 인코더에 있었다.
 - 마지막 단계: 개선 전 커밋과 같은 시간대에 번갈아 비교했다. perceptual은 약 10% 빨라졌고, 무손실은 측정 잡음(±5%) 안에서 같았다.

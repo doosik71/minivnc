@@ -4,25 +4,33 @@
 //! One thread reads and decodes server messages; the window runs on the
 //! main thread.
 
+mod config;
 mod conn;
 mod connbar;
 mod keys;
 mod platform;
+mod tunnel;
 mod ucs_table;
 mod window;
 
-use std::net::TcpStream;
-use std::path::PathBuf;
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rfb_auth::{Password, Passwords};
 use rfb_client::{Client, ConnectOptions, SecurityType, Stream};
 use rfb_proto::consts::*;
 
+/// The TurboVNC viewer's listen mode port.
+const LISTEN_PORT: u16 = 5500;
+
 const USAGE: &str = "\
 usage: minivnc-viewer [options] HOST[:DISPLAY | ::PORT]
+       minivnc-viewer [options] -listen [PORT]
 
   HOST:DISPLAY          connect to port 5900 + DISPLAY (default :0)
+  -listen [PORT]        wait for a server to connect (reverse connection,
+                        minivnc-server -connect) on PORT (default 5500)
   HOST::PORT            connect to PORT
   -Password=PASSWORD    VNC password (otherwise asked for when needed)
   -PasswordFile=FILE    VNC password file (TurboVNC format)
@@ -34,7 +42,7 @@ usage: minivnc-viewer [options] HOST[:DISPLAY | ::PORT]
   -X509CA=FILE          trusted certificate authorities for the X509 types
                         (default: ~/.vnc/x509_ca.pem); certificates accepted
                         at the prompt go to ~/.vnc/x509_savedcerts.pem
-  -Encoding=ENC         Tight (default) or Raw
+  -Encoding=ENC         Tight (default), ZRLE, Hextile or Raw
   -JPEG=0|1             allow JPEG compression with Tight (default 1)
   -Quality=Q            JPEG quality 1-100 (default 95)
   -Subsampling=S        JPEG chrominance subsampling: 1X (default), 2X, 4X,
@@ -44,13 +52,59 @@ usage: minivnc-viewer [options] HOST[:DISPLAY | ::PORT]
   -ViewOnly             do not send keyboard and mouse input
   -DesktopSize=MODE     Auto (default): resize the remote desktop to fit the
                         window; Server: keep the server's size
+  -Scale=S              scale the remote desktop: a percentage (10-400,
+                        default 100), Auto (fit the window) or FixedRatio
+                        (fit, keeping the aspect ratio); not 100 means
+                        -DesktopSize=Server
+  -Span=MODE            full screen on the Primary monitor, All monitors, or
+                        Auto: all if the desktop does not fit on one
+  -GrabKeyboard=MODE    pass Alt+Tab, Win and similar keys to the server
+                        (Windows): FS (in full screen, default), Always, or
+                        Manual; Ctrl+Alt+Shift+G grabs or ungrabs
+  -via GATEWAY          tunnel through ssh to GATEWAY ([user@]host[:port]);
+                        HOST is then as seen from the gateway
+  -config FILE          read options from a TurboVNC connection info file
+                        (FILE.turbovnc alone also works); options later on
+                        the command line take precedence
+  -SaveConfig=FILE      save the options to a connection info file
 
 Options take the form -Name=value or -Name value; boolean options alone
-mean 1. Set RUST_LOG (e.g. RUST_LOG=debug) to change the log level.
+mean 1. ~/.vnc/default.turbovnc, if it exists, gives the defaults (options
+MiniVNC does not have are skipped). Set RUST_LOG (e.g. RUST_LOG=debug) to
+change the log level.
 
 The maximize button switches to full screen; there, touch the top edge
 for the minimize/restore/close bar. Ctrl+Alt+Shift+L asks the server for a
 lossless refresh.";
+
+/// TurboVNC viewer `Scale`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scale {
+    Percent(u32),
+    /// Fit the window.
+    Auto,
+    /// Fit the window, keeping the aspect ratio.
+    FixedRatio,
+}
+
+/// TurboVNC viewer `Span`: which monitors full screen covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Span {
+    Primary,
+    All,
+    /// All monitors if the remote desktop does not fit on the window's.
+    Auto,
+}
+
+/// TurboVNC viewer `GrabKeyboard`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grab {
+    /// While in full screen.
+    FullScreen,
+    Always,
+    /// Only by the hot key.
+    Manual,
+}
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -73,6 +127,15 @@ struct Options {
     view_only: bool,
     /// `-DesktopSize=Auto`
     auto_resize: bool,
+    /// Listen mode: wait for a server on this port.
+    listen: Option<u16>,
+    scale: Scale,
+    span: Span,
+    grab: Grab,
+    /// SSH gateway (`-via`).
+    via: Option<String>,
+    /// Where to save the options (`-SaveConfig`).
+    save_config: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -94,6 +157,12 @@ impl Default for Options {
             shared: true,
             view_only: false,
             auto_resize: true,
+            listen: None,
+            scale: Scale::Percent(100),
+            span: Span::Auto,
+            grab: Grab::FullScreen,
+            via: None,
+            save_config: None,
         }
     }
 }
@@ -134,11 +203,16 @@ impl Options {
             self.encoding,
             ENCODING_COPY_RECT,
         ];
-        if self.encoding != ENCODING_TIGHT {
-            list.push(ENCODING_TIGHT);
-        }
-        if self.encoding != ENCODING_RAW {
-            list.push(ENCODING_RAW);
+        // The others, preferred in this order (Java `writeSetEncodings`).
+        for e in [
+            ENCODING_TIGHT,
+            ENCODING_ZRLE,
+            ENCODING_HEXTILE,
+            ENCODING_RAW,
+        ] {
+            if e != self.encoding {
+                list.push(e);
+            }
         }
         list.push(ENCODING_LAST_RECT);
         list.push(ENCODING_COMPRESS_LEVEL0 + self.compress_level);
@@ -190,15 +264,146 @@ fn parse_server(s: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), port))
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
+/// Applies one option. Returns `false` for names the viewer does not know.
+fn apply(
+    opts: &mut Options,
+    server: &mut Option<String>,
+    key: &str,
+    name: &str,
+    value: String,
+) -> Result<bool, String> {
+    let flag = || parse_bool(&value).ok_or_else(|| format!("bad {name} value {value}"));
+    match key {
+        "server" => *server = Some(value),
+        "password" => opts.password = Some(value),
+        "passwordfile" => opts.password_file = Some(value.into()),
+        "user" => opts.user = Some(value),
+        "securitytypes" => {
+            let types = rfb_proto::security::parse_security_types(&value)?;
+            // One-time passwords are VNC passwords to the viewer.
+            if let Some(t) = types.iter().find(|t| t.is_otp()) {
+                return Err(format!("{t} is a server-side security type; use VNC"));
+            }
+            if types.is_empty() {
+                return Err(format!("{name} is empty"));
+            }
+            opts.security_types = types;
+        }
+        "x509ca" => opts.x509_ca = Some(value.into()),
+        "listen" => {
+            opts.listen = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("bad {name} port {value}"))?,
+            )
+        }
+        "encoding" => {
+            opts.encoding = match value.to_ascii_lowercase().as_str() {
+                "tight" => ENCODING_TIGHT,
+                "zrle" => ENCODING_ZRLE,
+                "hextile" => ENCODING_HEXTILE,
+                "raw" => ENCODING_RAW,
+                _ => {
+                    return Err(format!(
+                        "unsupported encoding {value} (Tight, ZRLE, Hextile, Raw)"
+                    ));
+                }
+            }
+        }
+        "jpeg" => opts.jpeg = flag()?,
+        "quality" => opts.quality = parse_int(&value, name, 1..=100)?,
+        "subsampling" => {
+            opts.subsampling = match value.to_ascii_lowercase().as_str() {
+                "1x" | "none" => 0,
+                "4x" => ENCODING_SUBSAMP_4X - ENCODING_SUBSAMP_1X,
+                "2x" => ENCODING_SUBSAMP_2X - ENCODING_SUBSAMP_1X,
+                "gray" | "grey" => ENCODING_SUBSAMP_GRAY - ENCODING_SUBSAMP_1X,
+                _ => return Err(format!("bad {name} value {value} (1X, 2X, 4X, Gray)")),
+            }
+        }
+        "compresslevel" => opts.compress_level = parse_int(&value, name, 0..=9)?,
+        "shared" => opts.shared = flag()?,
+        "viewonly" => opts.view_only = flag()?,
+        "desktopsize" => {
+            opts.auto_resize = match value.to_ascii_lowercase().as_str() {
+                "auto" => true,
+                "server" => false,
+                _ => return Err(format!("bad {name} value {value} (Auto, Server)")),
+            }
+        }
+        "scale" => {
+            opts.scale = match value.to_ascii_lowercase().as_str() {
+                "auto" => Scale::Auto,
+                "fixedratio" => Scale::FixedRatio,
+                v => Scale::Percent(
+                    v.trim_end_matches('%')
+                        .parse()
+                        .ok()
+                        .filter(|p| (10..=400).contains(p))
+                        .ok_or_else(|| {
+                            format!("bad {name} value {value} (10-400, Auto, FixedRatio)")
+                        })?,
+                ),
+            }
+        }
+        "span" => {
+            opts.span = match value.to_ascii_lowercase().as_str() {
+                "primary" => Span::Primary,
+                "all" => Span::All,
+                "auto" => Span::Auto,
+                _ => return Err(format!("bad {name} value {value} (Primary, All, Auto)")),
+            }
+        }
+        "grabkeyboard" => {
+            opts.grab = match value.to_ascii_lowercase().as_str() {
+                "fs" => Grab::FullScreen,
+                "always" => Grab::Always,
+                "manual" => Grab::Manual,
+                _ => return Err(format!("bad {name} value {value} (FS, Always, Manual)")),
+            }
+        }
+        "via" => opts.via = Some(value),
+        "saveconfig" => opts.save_config = Some(value.into()),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Applies a connection info file; parameters MiniVNC does not have are
+/// skipped, since the file may be the TurboVNC viewer's.
+fn apply_file(opts: &mut Options, server: &mut Option<String>, path: &Path) -> Result<(), String> {
+    let params = config::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    for (name, value) in params {
+        let key = name.to_ascii_lowercase();
+        if !apply(opts, server, &key, &name, value)? {
+            tracing::debug!("{}: skipping {name}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Parses the command line after the defaults file, if any.
+fn parse_args(
+    args: impl Iterator<Item = String>,
+    defaults: Option<&Path>,
+) -> Result<Options, String> {
     let mut opts = Options::default();
     let mut server = None;
+    if let Some(path) = defaults.filter(|p| p.exists()) {
+        apply_file(&mut opts, &mut server, path)?;
+    }
+    let mut positional = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         if !arg.starts_with('-') {
-            if server.replace(parse_server(&arg)?).is_some() {
+            if arg.to_ascii_lowercase().ends_with(".turbovnc") {
+                apply_file(&mut opts, &mut server, Path::new(&arg))?;
+                continue;
+            }
+            if std::mem::replace(&mut positional, true) {
                 return Err(format!("more than one server given ({arg})"));
             }
+            server = Some(arg);
             continue;
         }
         let (name, inline) = match arg.split_once('=') {
@@ -214,59 +419,31 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
                 Some(_) => args.next().expect("peeked"),
                 None => "1".into(),
             },
-            None if matches!(key.as_str(), "h" | "help" | "?") => String::new(),
+            None if matches!(key.as_str(), "h" | "help" | "?") => return Err(String::new()),
+            // `-listen` alone, or followed by a port.
+            None if key == "listen" => match args.peek().and_then(|v| v.parse::<u16>().ok()) {
+                Some(_) => args.next().expect("peeked"),
+                None => LISTEN_PORT.to_string(),
+            },
             None => args.next().ok_or_else(|| format!("{name} needs a value"))?,
         };
-        let flag = || parse_bool(&value).ok_or_else(|| format!("bad {name} value {value}"));
-        match key.as_str() {
-            "password" => opts.password = Some(value),
-            "passwordfile" => opts.password_file = Some(value.into()),
-            "user" => opts.user = Some(value),
-            "securitytypes" => {
-                let types = rfb_proto::security::parse_security_types(&value)?;
-                // One-time passwords are VNC passwords to the viewer.
-                if let Some(t) = types.iter().find(|t| t.is_otp()) {
-                    return Err(format!("{t} is a server-side security type; use VNC"));
-                }
-                if types.is_empty() {
-                    return Err(format!("{name} is empty"));
-                }
-                opts.security_types = types;
-            }
-            "x509ca" => opts.x509_ca = Some(value.into()),
-            "encoding" => {
-                opts.encoding = match value.to_ascii_lowercase().as_str() {
-                    "tight" => ENCODING_TIGHT,
-                    "raw" => ENCODING_RAW,
-                    _ => return Err(format!("unsupported encoding {value} (Tight, Raw)")),
-                }
-            }
-            "jpeg" => opts.jpeg = flag()?,
-            "quality" => opts.quality = parse_int(&value, name, 1..=100)?,
-            "subsampling" => {
-                opts.subsampling = match value.to_ascii_lowercase().as_str() {
-                    "1x" | "none" => 0,
-                    "4x" => ENCODING_SUBSAMP_4X - ENCODING_SUBSAMP_1X,
-                    "2x" => ENCODING_SUBSAMP_2X - ENCODING_SUBSAMP_1X,
-                    "gray" | "grey" => ENCODING_SUBSAMP_GRAY - ENCODING_SUBSAMP_1X,
-                    _ => return Err(format!("bad {name} value {value} (1X, 2X, 4X, Gray)")),
-                }
-            }
-            "compresslevel" => opts.compress_level = parse_int(&value, name, 0..=9)?,
-            "shared" => opts.shared = flag()?,
-            "viewonly" => opts.view_only = flag()?,
-            "desktopsize" => {
-                opts.auto_resize = match value.to_ascii_lowercase().as_str() {
-                    "auto" => true,
-                    "server" => false,
-                    _ => return Err(format!("bad {name} value {value} (Auto, Server)")),
-                }
-            }
-            "h" | "help" | "?" => return Err(String::new()),
-            _ => return Err(format!("unknown option {name}")),
+        if key == "config" {
+            apply_file(&mut opts, &mut server, Path::new(&value))?;
+        } else if !apply(&mut opts, &mut server, &key, name, value)? {
+            return Err(format!("unknown option {name}"));
         }
     }
-    (opts.host, opts.port) = server.ok_or("no server given")?;
+    match (server, opts.listen) {
+        (Some(s), None) => (opts.host, opts.port) = parse_server(&s)?,
+        (None, Some(_)) => {}
+        (Some(_), Some(_)) => return Err("-listen takes no server".into()),
+        (None, None) => return Err("no server given".into()),
+    }
+    if opts.scale != Scale::Percent(100) && opts.auto_resize {
+        // As the TurboVNC viewer: scaling and remote resizing exclude each
+        // other.
+        opts.auto_resize = false;
+    }
     Ok(opts)
 }
 
@@ -313,7 +490,31 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
         (None, Some(path)) => Some(Passwords::read_file(path)?.full),
         (None, None) => None,
     };
-    let stream = TcpStream::connect((opts.host.as_str(), opts.port))?;
+    let (mut host, mut port) = (opts.host.clone(), opts.port);
+    // Kept open until the connection ends.
+    let mut tunnel = None;
+    let stream = match opts.listen {
+        // As the TurboVNC viewer's listen mode, but for one connection.
+        Some(listen) => {
+            let listener = TcpListener::bind((Ipv6Addr::UNSPECIFIED, listen))
+                .or_else(|_| TcpListener::bind((Ipv4Addr::UNSPECIFIED, listen)))?;
+            tracing::info!("listening for a VNC server on port {listen}");
+            let (stream, peer) = listener.accept()?;
+            tracing::info!("connection from {peer}");
+            (host, port) = (peer.ip().to_canonical().to_string(), peer.port());
+            stream
+        }
+        None => match &opts.via {
+            // The certificate is still checked against the server's name.
+            Some(gateway) => {
+                let t = tunnel::open(gateway, &opts.host, opts.port)?;
+                let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, t.port))?;
+                tunnel = Some(t);
+                stream
+            }
+            None => TcpStream::connect((opts.host.as_str(), opts.port))?,
+        },
+    };
     stream.set_nodelay(true)?;
     let stream = Stream::new(stream);
     let writer = conn::Writer::new(stream.clone());
@@ -325,7 +526,7 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
         user: opts.user.clone(),
         login_password: None,
         ask_login: Some(ask_login),
-        host: opts.host.clone(),
+        host: host.clone(),
         x509_ca: opts
             .x509_ca
             .clone()
@@ -338,15 +539,17 @@ fn run(opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let v = client.version();
     tracing::info!(
         "connected to {}:{}: RFB {}.{}, \"{}\", {}x{}",
-        opts.host,
-        opts.port,
+        host,
+        port,
         v.major,
         v.minor,
         client.name(),
         client.framebuffer().width(),
         client.framebuffer().height()
     );
-    window::run(client, writer, opts)
+    let result = window::run(client, writer, opts);
+    drop(tunnel);
+    result
 }
 
 fn main() -> ExitCode {
@@ -355,7 +558,8 @@ fn main() -> ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let opts = match parse_args(std::env::args().skip(1)) {
+    let defaults = vnc_dir().map(|d| d.join("default.turbovnc"));
+    let opts = match parse_args(std::env::args().skip(1), defaults.as_deref()) {
         Ok(o) => o,
         Err(e) => {
             if !e.is_empty() {
@@ -365,6 +569,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(path) = &opts.save_config {
+        match config::write(path, &opts) {
+            Ok(()) => tracing::info!("options saved to {}", path.display()),
+            Err(e) => {
+                eprintln!("minivnc-viewer: cannot save {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -379,7 +592,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Options, String> {
-        parse_args(args.iter().map(|s| s.to_string()))
+        parse_args(args.iter().map(|s| s.to_string()), None)
     }
 
     #[test]
@@ -413,8 +626,93 @@ mod tests {
         assert_eq!((o.host.as_str(), o.port), ("myhost", 5903));
         assert!(!parse(&["-DesktopSize=Server", "h"]).unwrap().auto_resize);
         assert!(parse(&["-Quality=0", "h"]).is_err());
-        assert!(parse(&["-Encoding=ZRLE", "h"]).is_err());
+        assert_eq!(
+            parse(&["-Encoding=zrle", "h"]).unwrap().encoding,
+            ENCODING_ZRLE
+        );
+        assert!(parse(&["-Encoding=RRE", "h"]).is_err());
         assert!(parse(&["-Bogus", "h"]).is_err());
+    }
+
+    #[test]
+    fn m8_options() {
+        let o = parse(&["-listen"]).unwrap();
+        assert_eq!(o.listen, Some(LISTEN_PORT));
+        assert_eq!(parse(&["-listen", "5600"]).unwrap().listen, Some(5600));
+        assert!(parse(&["-listen", "host:1"]).is_err());
+        let o = parse(&[
+            "-Scale=150%",
+            "-Span",
+            "All",
+            "-GrabKeyboard=Manual",
+            "-via",
+            "gw",
+            "h",
+        ])
+        .unwrap();
+        assert_eq!(o.scale, Scale::Percent(150));
+        assert_eq!((o.span, o.grab), (Span::All, Grab::Manual));
+        assert_eq!(o.via.as_deref(), Some("gw"));
+        // Scaling turns remote resizing off, as in the TurboVNC viewer.
+        assert!(!o.auto_resize);
+        assert_eq!(
+            parse(&["-Scale=FixedRatio", "h"]).unwrap().scale,
+            Scale::FixedRatio
+        );
+        assert!(parse(&["-Scale=5", "h"]).is_err());
+    }
+
+    #[test]
+    fn connection_info_files() {
+        let dir = std::env::temp_dir().join(format!("minivnc-viewer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("work.turbovnc");
+        std::fs::write(
+            &file,
+            "[connection]\nServer=filehost:3\n[options]\nQuality=70\nToolBar=0\nEncoding=ZRLE\n",
+        )
+        .unwrap();
+        // The file's server and options; TurboVNC-only ToolBar is skipped;
+        // later command-line options win.
+        let f = file.to_str().unwrap();
+        let o = parse(&[f, "-Quality=60"]).unwrap();
+        assert_eq!((o.host.as_str(), o.port), ("filehost", 5903));
+        assert_eq!((o.quality, o.encoding), (60, ENCODING_ZRLE));
+        assert_eq!(parse(&["-config", f]).unwrap().quality, 70);
+        // Defaults come first.
+        let defaults = dir.join("default.turbovnc");
+        std::fs::write(&defaults, "JPEG=0\nQuality=50\n").unwrap();
+        let o = parse_args(
+            ["-Quality=40", "h"].iter().map(|s| s.to_string()),
+            Some(&defaults),
+        )
+        .unwrap();
+        assert_eq!((o.jpeg, o.quality), (false, 40));
+        // What is saved reads back the same.
+        let saved = dir.join("saved.turbovnc");
+        let o = parse(&[
+            "-Scale=Auto",
+            "-Subsampling=2X",
+            "-ViewOnly",
+            "-via",
+            "gw",
+            "h:2",
+        ])
+        .unwrap();
+        config::write(&saved, &o).unwrap();
+        let back = parse(&[saved.to_str().unwrap()]).unwrap();
+        assert_eq!(
+            (
+                back.host,
+                back.port,
+                back.scale,
+                back.subsampling,
+                back.view_only,
+                back.via
+            ),
+            (o.host, o.port, o.scale, o.subsampling, true, o.via)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -438,6 +736,8 @@ mod tests {
                 ENCODING_EXTENDED_MOUSE_BUTTONS,
                 ENCODING_TIGHT,
                 ENCODING_COPY_RECT,
+                ENCODING_ZRLE,
+                ENCODING_HEXTILE,
                 ENCODING_RAW,
                 ENCODING_LAST_RECT,
                 ENCODING_COMPRESS_LEVEL0 + 1,
@@ -455,5 +755,24 @@ mod tests {
             lossless.encodings().last(),
             Some(&(ENCODING_COMPRESS_LEVEL0))
         );
+        // Another encoding first, then Tight, ZRLE, Hextile, Raw; the coarse
+        // quality level as for TightVNC-style encodings.
+        let zrle = Options {
+            encoding: ENCODING_ZRLE,
+            ..Options::default()
+        };
+        let list = zrle.encodings();
+        let at = list.iter().position(|&e| e == ENCODING_ZRLE).unwrap();
+        assert_eq!(
+            list[at..at + 5],
+            [
+                ENCODING_ZRLE,
+                ENCODING_COPY_RECT,
+                ENCODING_TIGHT,
+                ENCODING_HEXTILE,
+                ENCODING_RAW
+            ]
+        );
+        assert_eq!(list.last(), Some(&(ENCODING_QUALITY_LEVEL0 + 9)));
     }
 }

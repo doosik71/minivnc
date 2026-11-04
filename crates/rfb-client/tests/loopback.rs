@@ -326,7 +326,7 @@ fn updates_wait_for_the_defer_time() {
     assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
 }
 
-fn next_update(client: &mut Client<Stream>) -> Vec<Rect> {
+fn next_update<S: Read + Write>(client: &mut Client<S>) -> Vec<Rect> {
     loop {
         if let Event::FramebufferUpdate(rects) = client.read_message().unwrap() {
             return rects;
@@ -355,7 +355,12 @@ fn full_update_matches_screen_in_each_pixel_format() {
     };
 
     // None = never send SetEncodings (TurboVNC then uses Tight, CL 1).
-    let mut encoding_lists: Vec<Option<Vec<i32>>> = vec![None, Some(vec![ENCODING_RAW])];
+    let mut encoding_lists: Vec<Option<Vec<i32>>> = vec![
+        None,
+        Some(vec![ENCODING_RAW]),
+        Some(vec![ENCODING_HEXTILE]),
+        Some(vec![ENCODING_ZRLE]),
+    ];
     for cl in [0, 1, 6, 9] {
         for extra in [vec![], vec![ENCODING_TIGHT_WITHOUT_ZLIB]] {
             let mut list = vec![
@@ -1342,4 +1347,228 @@ fn lossless_refresh_sequence() {
     client.set_encodings(&jpeg).unwrap();
     next_update(&mut client);
     assert!(noise_exact(&client));
+}
+
+/// A minimal WebSocket client (RFC 6455) over any byte stream, for the
+/// server's WebSocket support. `base64` asks for that subprotocol only.
+struct WsClient<S> {
+    inner: S,
+    base64: bool,
+    pending: Vec<u8>,
+}
+
+impl<S: Read + Write> WsClient<S> {
+    fn connect(mut inner: S, base64: bool) -> Self {
+        let protocol = if base64 { "base64" } else { "binary" };
+        write!(
+            inner,
+            "GET /websockify HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {protocol}\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut b = [0];
+            inner.read_exact(&mut b).unwrap();
+            response.push(b[0]);
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 101 "), "{response}");
+        assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
+        assert!(response.contains(&format!("Sec-WebSocket-Protocol: {protocol}\r\n")));
+        Self {
+            inner,
+            base64,
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl<S: Read + Write> Read for WsClient<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.pending.is_empty() {
+            let mut head = [0; 2];
+            self.inner.read_exact(&mut head)?;
+            assert_eq!(head[1] & 0x80, 0, "server frames are not masked");
+            let len = match head[1] & 0x7F {
+                126 => {
+                    let mut l = [0; 2];
+                    self.inner.read_exact(&mut l)?;
+                    usize::from(u16::from_be_bytes(l))
+                }
+                127 => {
+                    let mut l = [0; 8];
+                    self.inner.read_exact(&mut l)?;
+                    u64::from_be_bytes(l) as usize
+                }
+                n => usize::from(n),
+            };
+            let mut payload = vec![0; len];
+            self.inner.read_exact(&mut payload)?;
+            match head[0] & 0x0F {
+                1 => {
+                    assert!(self.base64);
+                    self.pending =
+                        openssl::base64::decode_block(std::str::from_utf8(&payload).unwrap())
+                            .unwrap();
+                }
+                2 => self.pending = payload,
+                8 => return Ok(0),
+                _ => {}
+            }
+        }
+        let n = buf.len().min(self.pending.len());
+        buf[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+}
+
+impl<S: Read + Write> Write for WsClient<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let (opcode, payload) = if self.base64 {
+            (1, openssl::base64::encode_block(buf).into_bytes())
+        } else {
+            (2, buf.to_vec())
+        };
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        let mut frame = vec![0x80 | opcode];
+        match payload.len() {
+            n @ 0..=125 => frame.push(0x80 | n as u8),
+            n => {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        self.inner.write_all(&frame)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: Read + Write> rfb_client::Transport for WsClient<S> {
+    fn start_tls(&mut self, _: openssl::ssl::Ssl) -> std::io::Result<Vec<openssl::x509::X509>> {
+        Err(std::io::Error::other("not needed here"))
+    }
+}
+
+/// A whole screen through `transport`, checked against the pattern.
+fn check_full_update(transport: impl rfb_client::Transport) {
+    let options = ConnectOptions {
+        password: Some(Password::new(b"secret")),
+        ..Default::default()
+    };
+    let mut client = Client::connect(transport, &options).unwrap();
+    client.set_encodings(&[ENCODING_ZRLE]).unwrap();
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    assert_eq!(area(&next_update(&mut client)), u32::from(W) * u32::from(H));
+    for (x, y) in [(0, 0), (70, 10), (150, 60), (199, 119)] {
+        assert_eq!(
+            client.framebuffer().pixel(x, y),
+            pack_rgb(&RGB888, pattern_rgb(x, y))
+        );
+    }
+}
+
+#[test]
+fn websocket_clients_on_the_rfb_port() {
+    let dir = std::env::temp_dir().join(format!("minivnc-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = self_signed("localhost");
+    std::fs::write(dir.join("cert.pem"), cert).unwrap();
+    std::fs::write(dir.join("key.pem"), key).unwrap();
+    let config = Config {
+        passwords: Some(passwords()),
+        x509_cert: Some(dir.join("cert.pem")),
+        x509_key: Some(dir.join("key.pem")),
+        ..Config::default()
+    };
+    let addr = start_with(Pattern, config, None);
+    let tcp = || {
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    // A plain RFB client, binary and base64 WebSockets, and wss.
+    check_full_update(Stream::new(tcp()));
+    check_full_update(WsClient::connect(tcp(), false));
+    check_full_update(WsClient::connect(tcp(), true));
+    let mut connector =
+        openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
+    connector.set_verify(openssl::ssl::SslVerifyMode::NONE);
+    let tls = connector.build().connect("localhost", tcp()).unwrap();
+    check_full_update(WsClient::connect(tls, false));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Starts a server that connects to each of `targets` (reverse
+/// connections) and also listens.
+fn start_reverse(config: Config, targets: Vec<String>) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = Server::start(config, Pattern, None).unwrap();
+            for t in &targets {
+                server.connect(t).await.unwrap();
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            server.serve(listener).await.unwrap();
+        });
+    });
+}
+
+#[test]
+fn reverse_connections_and_repeater_id() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // X509 types need a certificate, but are not offered on reverse
+    // connections.
+    let dir = std::env::temp_dir().join(format!("minivnc-rev-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = self_signed("localhost");
+    std::fs::write(dir.join("c.pem"), cert).unwrap();
+    std::fs::write(dir.join("k.pem"), key).unwrap();
+    let config = Config {
+        security_types: vec![SecurityType::X509Vnc, SecurityType::Vnc],
+        passwords: Some(passwords()),
+        x509_cert: Some(dir.join("c.pem")),
+        x509_key: Some(dir.join("k.pem")),
+        ..Config::default()
+    };
+    start_reverse(
+        config,
+        vec![
+            format!("127.0.0.1:{port}"),
+            format!("127.0.0.1:{port}#4242"),
+        ],
+    );
+    let accept = || {
+        let (s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    // A viewer in listen mode, offered only VNC authentication.
+    let options = ConnectOptions {
+        security_types: vec![SecurityType::X509Vnc, SecurityType::Vnc],
+        password: Some(Password::new(b"secret")),
+        ..Default::default()
+    };
+    let mut client = Client::connect(Stream::new(accept()), &options).unwrap();
+    client.request_update(false, Rect::new(0, 0, W, H)).unwrap();
+    assert_eq!(area(&next_update(&mut client)), u32::from(W) * u32::from(H));
+
+    // Through a repeater: 250 bytes of "ID:4242", then RFB.
+    let mut repeater_side = accept();
+    let mut intro = [0; 250];
+    repeater_side.read_exact(&mut intro).unwrap();
+    assert!(intro.starts_with(b"ID:4242\0"));
+    assert!(intro[7..].iter().all(|&b| b == 0));
+    assert!(Client::connect(Stream::new(repeater_side), &options).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
 }

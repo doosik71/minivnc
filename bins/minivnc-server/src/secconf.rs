@@ -18,6 +18,7 @@ pub struct SecurityConfig {
     pub permitted: Option<Vec<SecurityType>>,
     pub no_remote_resize: bool,
     pub no_remote_connections: bool,
+    pub no_reverse_connections: bool,
     pub no_clipboard_send: bool,
     pub no_clipboard_recv: bool,
     pub enable_user_acl: bool,
@@ -60,6 +61,7 @@ impl SecurityConfig {
             match key {
                 "no-remote-resize" => c.no_remote_resize = true,
                 "no-remote-connections" => c.no_remote_connections = true,
+                "no-reverse-connections" => c.no_reverse_connections = true,
                 "no-clipboard-send" => c.no_clipboard_send = true,
                 "no-clipboard-recv" => c.no_clipboard_recv = true,
                 "enable-user-acl" => c.enable_user_acl = true,
@@ -84,8 +86,7 @@ impl SecurityConfig {
                     c.max_desktop_size = Some(size);
                 }
                 // Features MiniVNC does not have.
-                "no-reverse-connections"
-                | "no-x11-tcp-connections"
+                "no-x11-tcp-connections"
                 | "no-x11-host-access"
                 | "no-pam-sessions"
                 | "tls-key-length"

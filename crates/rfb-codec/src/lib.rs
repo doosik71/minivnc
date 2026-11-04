@@ -7,10 +7,12 @@ use rfb_proto::Rect;
 pub mod clipboard;
 pub mod copyrect;
 mod framebuffer;
+pub mod hextile;
 pub mod jpeg;
 pub mod raw;
 pub mod tight;
 pub mod translate;
+pub mod zrle;
 
 pub use framebuffer::{Framebuffer, pack_rgb, read_pixel, unpack_rgb, write_pixel};
 pub use jpeg::JpegError;

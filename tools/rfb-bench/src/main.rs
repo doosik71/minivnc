@@ -34,6 +34,7 @@ usage: rfb-bench [options] HOST[:DISPLAY | ::PORT]
                     medium         Tight, JPEG Q80, 2X, CL 6
                     low            Tight, JPEG Q30, 4X, CL 7
                     raw            Raw
+                    zrle, hextile  ZRLE, Hextile
   -time SECS      measure for SECS seconds (default 30)
   -interval SECS  also report every SECS seconds (default 5)
   -record FILE    save the received stream for -replay
@@ -64,6 +65,8 @@ fn preset_encodings(name: &str) -> Option<Vec<i32>> {
         "medium" => tight(6, Some((80, 2))),
         "low" => tight(7, Some((30, 1))),
         "raw" => vec![ENCODING_RAW],
+        "zrle" => vec![ENCODING_ZRLE],
+        "hextile" => vec![ENCODING_HEXTILE],
         _ => return None,
     };
     list.extend([

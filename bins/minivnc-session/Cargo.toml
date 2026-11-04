@@ -1,0 +1,16 @@
+[package]
+name = "minivnc-session"
+description = "MiniVNC session manager (TurboVNC vncserver counterpart)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfb-auth = { path = "../../crates/rfb-auth" }
+rustix = { version = "1.1.6", features = ["process", "system"] }
+signal-hook = "0.3"

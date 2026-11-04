@@ -26,6 +26,7 @@ usage: rfb-snapshot [options] HOST[:DISPLAY | ::PORT] OUTPUT.png
                     medium         Tight, JPEG Q80, 2X, CL 6
                     low            Tight, JPEG Q30, 4X, CL 7
                     raw            Raw
+                    zrle, hextile  ZRLE, Hextile
   -timeout SECS   give up after SECS seconds without data (default 10)
 
 Prints the number of bytes the screen update took.";
@@ -57,6 +58,8 @@ fn preset_encodings(name: &str) -> Option<Vec<i32>> {
         "medium" => tight(6, Some((80, 2))),
         "low" => tight(7, Some((30, 1))),
         "raw" => vec![ENCODING_RAW, ENCODING_RICH_CURSOR],
+        "zrle" => vec![ENCODING_ZRLE, ENCODING_RICH_CURSOR],
+        "hextile" => vec![ENCODING_HEXTILE, ENCODING_RICH_CURSOR],
         _ => return None,
     })
 }

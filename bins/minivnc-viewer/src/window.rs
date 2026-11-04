@@ -21,7 +21,7 @@ use rfb_proto::msg::{ClientMessage, Screen as ScreenDesc};
 use softbuffer::Surface;
 use tracing::{debug, info, trace};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -30,7 +30,7 @@ use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
 use crate::conn::{self, Notice, SharedClipboard, SharedScreen, Writer};
 use crate::connbar;
-use crate::{Options, keys, platform};
+use crate::{Grab, Options, Scale, Span, keys, platform};
 
 /// Scroll bar thickness in pixels.
 const BAR: u32 = 14;
@@ -101,6 +101,8 @@ struct Shown {
     offset: (usize, usize),
     layout: Layout,
     remote: (usize, usize),
+    /// The remote desktop is drawn scaled.
+    scaled: bool,
 }
 
 /// How many frames' damage is kept for buffers presented that long ago.
@@ -181,6 +183,14 @@ struct App {
     awaiting_resize: bool,
     /// When to resize the remote desktop to the window (Auto mode).
     resize_at: Option<Instant>,
+    scale: Scale,
+    span: Span,
+    /// Full screen over several monitors: a borderless window, and where
+    /// the window was before.
+    spanning: Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>,
+    grab: Grab,
+    /// Set by the grab hot key, overriding `grab`.
+    grab_override: Option<bool>,
     /// The full-screen connection bar is showing.
     connbar: bool,
     /// Until when maximizing does not switch to full screen.
@@ -190,20 +200,114 @@ struct App {
 
 impl App {
     fn fullscreen(&self) -> bool {
-        self.window
+        self.spanning.is_some()
+            || self
+                .window
+                .as_ref()
+                .is_some_and(|w| w.fullscreen().is_some())
+    }
+
+    /// The size the remote desktop is drawn at (TurboVNC viewer `Scale`).
+    fn content(&self) -> (u32, u32) {
+        let (rw, rh) = (self.remote.0.max(1), self.remote.1.max(1));
+        let window = self
+            .window
             .as_ref()
-            .is_some_and(|w| w.fullscreen().is_some())
+            .map_or((rw, rh), |w| (w.inner_size().width, w.inner_size().height));
+        match self.scale {
+            Scale::Percent(p) => ((rw * p / 100).max(1), (rh * p / 100).max(1)),
+            Scale::Auto => (window.0.max(1), window.1.max(1)),
+            Scale::FixedRatio => {
+                let f =
+                    (f64::from(window.0) / f64::from(rw)).min(f64::from(window.1) / f64::from(rh));
+                (
+                    ((f64::from(rw) * f) as u32).max(1),
+                    ((f64::from(rh) * f) as u32).max(1),
+                )
+            }
+        }
+    }
+
+    /// The largest window that shows no margin: the drawn desktop, unless
+    /// scaling follows the window.
+    fn max_window(&self) -> Option<PhysicalSize<u32>> {
+        match self.scale {
+            Scale::Percent(_) if !self.auto_resize => {
+                let (w, h) = self.content();
+                Some(PhysicalSize::new(w, h))
+            }
+            _ => None,
+        }
+    }
+
+    fn grabbing(&self) -> bool {
+        self.grab_override.unwrap_or(match self.grab {
+            Grab::Always => true,
+            Grab::FullScreen => self.fullscreen(),
+            Grab::Manual => false,
+        })
+    }
+
+    /// Grabs the keyboard as `GrabKeyboard` and the hot key say.
+    fn update_grab(&self) {
+        if let Some(w) = &self.window {
+            platform::grab_keyboard(w, self.grabbing());
+        }
+    }
+
+    fn toggle_grab(&mut self) {
+        self.grab_override = Some(!self.grabbing());
+        info!(
+            "keyboard {}",
+            if self.grabbing() {
+                "grabbed"
+            } else {
+                "released"
+            }
+        );
+        self.update_grab();
     }
 
     fn width(&self) -> u32 {
         self.window.as_ref().map_or(0, |w| w.inner_size().width)
     }
 
-    /// Full screen on the window's monitor, with no title bar.
+    /// Full screen with no title bar: on the window's monitor, or across
+    /// all monitors as `Span` says.
     fn enter_fullscreen(&mut self) {
-        if let Some(w) = &self.window {
+        let Some(w) = &self.window else { return };
+        let monitors: Vec<_> = w.available_monitors().collect();
+        let all = match self.span {
+            Span::Primary => false,
+            Span::All => true,
+            Span::Auto => w.current_monitor().is_some_and(|m| {
+                let (cw, ch) = self.content();
+                cw > m.size().width || ch > m.size().height
+            }),
+        };
+        if !all || monitors.len() < 2 {
             w.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            self.update_grab();
+            return;
         }
+        // winit has no full screen over several monitors: a borderless
+        // window covering them all.
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for m in &monitors {
+            let (p, s) = (m.position(), m.size());
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x + s.width as i32);
+            y1 = y1.max(p.y + s.height as i32);
+        }
+        let before = (w.outer_position().unwrap_or_default(), w.inner_size());
+        w.set_maximized(false);
+        w.set_decorations(false);
+        w.set_outer_position(PhysicalPosition::new(x0, y0));
+        let _ = w.request_inner_size(PhysicalSize::new((x1 - x0) as u32, (y1 - y0) as u32));
+        info!("full screen across {} monitors", monitors.len());
+        self.spanning = Some(before);
+        self.update_grab();
     }
 
     /// Back to a normal window, not maximized.
@@ -211,9 +315,19 @@ impl App {
         self.connbar = false;
         self.restore_guard = Some(Instant::now() + RESTORE_GUARD);
         if let Some(w) = &self.window {
-            w.set_fullscreen(None);
-            w.set_maximized(false);
+            match self.spanning.take() {
+                Some((position, size)) => {
+                    w.set_decorations(true);
+                    w.set_outer_position(position);
+                    let _ = w.request_inner_size(size);
+                }
+                None => {
+                    w.set_fullscreen(None);
+                    w.set_maximized(false);
+                }
+            }
         }
+        self.update_grab();
     }
 
     /// Shows or hides the connection bar as the pointer moves. Returns
@@ -255,7 +369,7 @@ impl App {
     }
     fn layout(&self) -> Option<Layout> {
         let size = self.window.as_ref()?.inner_size();
-        Some(layout((size.width, size.height), self.remote))
+        Some(layout((size.width, size.height), self.content()))
     }
 
     fn redraw(&self) {
@@ -265,8 +379,9 @@ impl App {
     }
 
     fn clamp_offset(&mut self, l: Layout) {
-        self.offset.0 = self.offset.0.min(self.remote.0.saturating_sub(l.view.0));
-        self.offset.1 = self.offset.1.min(self.remote.1.saturating_sub(l.view.1));
+        let content = self.content();
+        self.offset.0 = self.offset.0.min(content.0.saturating_sub(l.view.0));
+        self.offset.1 = self.offset.1.min(content.1.saturating_sub(l.view.1));
     }
 
     fn send(&self, msg: ClientMessage) {
@@ -323,8 +438,14 @@ impl App {
         if x >= l.view.0 || y >= l.view.1 {
             return;
         }
-        let rx = (self.offset.0 + x).min(self.remote.0 - 1) as u16;
-        let ry = (self.offset.1 + y).min(self.remote.1 - 1) as u16;
+        // Window pixels to remote pixels, through the scaling.
+        let content = self.content();
+        let to_remote = |v: u32, remote: u32, drawn: u32| {
+            ((u64::from(v) * u64::from(remote) / u64::from(drawn.max(1))) as u32)
+                .min(remote.saturating_sub(1)) as u16
+        };
+        let rx = to_remote(self.offset.0 + x, self.remote.0, content.0);
+        let ry = to_remote(self.offset.1 + y, self.remote.1, content.1);
         self.send(ClientMessage::PointerEvent {
             buttons: self.buttons,
             x: rx,
@@ -347,9 +468,10 @@ impl App {
     /// Centres the thumb of the dragged bar on the cursor.
     fn drag_to_cursor(&mut self, axis: Axis) {
         let Some(l) = self.layout() else { return };
+        let content = self.content();
         let (track, view, remote, at) = match axis {
-            Axis::Horizontal => (l.view.0, l.view.0, self.remote.0, self.cursor.0),
-            Axis::Vertical => (l.view.1, l.view.1, self.remote.1, self.cursor.1),
+            Axis::Horizontal => (l.view.0, l.view.0, content.0, self.cursor.0),
+            Axis::Vertical => (l.view.1, l.view.1, content.1, self.cursor.1),
         };
         let centre = at.max(0.0) * f64::from(remote) / f64::from(track.max(1));
         let offset = (centre - f64::from(view) / 2.0).max(0.0) as u32;
@@ -402,6 +524,7 @@ impl App {
             return Ok(());
         };
         self.clamp_offset(l);
+        let content = self.content();
         let surface = self.surface.as_mut().expect("created with the window");
         surface.resize(w, h)?;
         let mut buf = surface.buffer_mut()?;
@@ -413,11 +536,14 @@ impl App {
         let mut screen = self.screen.lock();
         let (rw, rh) = (usize::from(screen.width), usize::from(screen.height));
         let damage = std::mem::take(&mut screen.damage);
+        let (cw, ch) = (content.0 as usize, content.1 as usize);
+        let scaled = (cw, ch) != (rw, rh);
         let shown = Shown {
             window: (w, h),
             offset: (ox, oy),
             layout: l,
             remote: (rw, rh),
+            scaled,
         };
 
         // Only the changed pixels, if the buffer holds an earlier frame of
@@ -426,6 +552,7 @@ impl App {
         let since = age.saturating_sub(1);
         if self.partial_redraw
             && !self.connbar
+            && !scaled
             && self.shown == Some(shown)
             && age >= 1
             && since <= self.history.len()
@@ -462,11 +589,29 @@ impl App {
         self.history.push_front(None);
         self.history.truncate(DAMAGE_HISTORY);
 
-        let vthumb = thumb(l.view.1, l.view.1, self.remote.1, self.offset.1);
-        let hthumb = thumb(l.view.0, l.view.0, self.remote.0, self.offset.0);
+        let vthumb = thumb(l.view.1, l.view.1, content.1, self.offset.1);
+        let hthumb = thumb(l.view.0, l.view.0, content.0, self.offset.0);
+        // Scaling picks the nearest remote pixel; the columns are the same
+        // on every row.
+        let columns: Vec<usize> = if scaled && ox < cw {
+            (ox..cw.min(ox + vw)).map(|x| x * rw / cw).collect()
+        } else {
+            Vec::new()
+        };
         for (y, row) in buf.chunks_exact_mut(w).take(h).enumerate() {
             if y < vh {
-                let n = if oy + y < rh && ox < rw {
+                let n = if scaled {
+                    if oy + y < ch {
+                        let src = (oy + y) * rh / ch * rw;
+                        let line = &screen.pixels[src..src + rw];
+                        for (p, &x) in row.iter_mut().zip(&columns) {
+                            *p = line[x];
+                        }
+                        columns.len()
+                    } else {
+                        0
+                    }
+                } else if oy + y < rh && ox < rw {
                     let n = vw.min(rw - ox);
                     let start = (oy + y) * rw + ox;
                     row[..n].copy_from_slice(&screen.pixels[start..start + n]);
@@ -570,15 +715,22 @@ impl App {
             Notice::DesktopSize { width, height } => {
                 self.remote = (u32::from(width), u32::from(height));
                 if let Some(window) = &self.window {
-                    let size = PhysicalSize::new(u32::from(width), u32::from(height));
+                    let (cw, ch) = self.content();
+                    let size = PhysicalSize::new(cw, ch);
                     let inner = window.inner_size();
                     if !self.auto_resize {
-                        window.set_max_inner_size(Some(size));
+                        window.set_max_inner_size(self.max_window());
                     }
-                    // A server-side change: follow it with the window.
+                    // A server-side change: follow it with the window,
+                    // unless scaling fits the desktop to the window.
                     let ours =
                         self.auto_resize && (self.awaiting_resize || self.resize_at.is_some());
-                    if (inner.width, inner.height) != self.remote && !ours {
+                    let fits = matches!(self.scale, Scale::Auto | Scale::FixedRatio);
+                    if (inner.width, inner.height) != (cw, ch)
+                        && !ours
+                        && !fits
+                        && !self.fullscreen()
+                    {
                         let _ = window.request_inner_size(size);
                     }
                 }
@@ -658,12 +810,13 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let size = PhysicalSize::new(self.remote.0, self.remote.1);
+        let (cw, ch) = self.content();
+        let size = PhysicalSize::new(cw, ch);
         let mut attrs = Window::default_attributes()
             .with_title(&self.title)
             .with_inner_size(size);
-        if !self.auto_resize {
-            attrs = attrs.with_max_inner_size(size);
+        if let Some(max) = self.max_window() {
+            attrs = attrs.with_max_inner_size(max);
         }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Rc::new(w),
@@ -691,6 +844,7 @@ impl ApplicationHandler<UserEvent> for App {
             window.set_cursor(event_loop.create_custom_cursor(source));
         }
         self.window = Some(window);
+        self.update_grab();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -754,19 +908,26 @@ impl ApplicationHandler<UserEvent> for App {
             // otherwise stay pressed on the server.
             WindowEvent::Focused(false) => self.release_all_keys(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            // TurboVNC viewer hot key: Ctrl+Alt+Shift+L asks for a lossless
-            // refresh; the L is not sent.
+            // TurboVNC viewer hot keys, which are not sent: Ctrl+Alt+Shift+L
+            // asks for a lossless refresh, Ctrl+Alt+Shift+G grabs or
+            // ungrabs the keyboard.
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: false,
                 ..
-            } if event.physical_key == PhysicalKey::Code(KeyCode::KeyL)
-                && self.modifiers.control_key()
+            } if matches!(
+                event.physical_key,
+                PhysicalKey::Code(KeyCode::KeyL | KeyCode::KeyG)
+            ) && self.modifiers.control_key()
                 && self.modifiers.alt_key()
                 && self.modifiers.shift_key() =>
             {
                 if event.state == ElementState::Pressed && !event.repeat {
-                    self.lossless_refresh();
+                    if event.physical_key == PhysicalKey::Code(KeyCode::KeyL) {
+                        self.lossless_refresh();
+                    } else {
+                        self.toggle_grab();
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
@@ -938,6 +1099,11 @@ pub fn run(client: Client<Stream>, writer: Writer, opts: &Options) -> Result<(),
         server_leds: None,
         awaiting_resize: false,
         resize_at: None,
+        scale: opts.scale,
+        span: opts.span,
+        spanning: None,
+        grab: opts.grab,
+        grab_override: None,
         connbar: false,
         restore_guard: None,
         error: None,
@@ -964,6 +1130,7 @@ mod tests {
                 vbar: true,
             },
             remote: (200, 150),
+            scaled: false,
         };
         // Clipped to the view, which shows remote (10, 20)-(100, 90).
         assert_eq!(

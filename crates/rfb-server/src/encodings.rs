@@ -12,7 +12,8 @@ const JPEG_SUBSAMP: [u8; 10] = [1, 1, 1, 2, 2, 2, 0, 0, 0, 0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EncodingPrefs {
-    /// `ENCODING_RAW` or `ENCODING_TIGHT`.
+    /// `ENCODING_RAW`, `ENCODING_HEXTILE`, `ENCODING_ZRLE` or
+    /// `ENCODING_TIGHT`.
     pub preferred: i32,
     pub tight: TightSettings,
 }
@@ -32,9 +33,9 @@ impl EncodingPrefs {
     /// from the defaults (except Tight-without-zlib, which stays enabled once
     /// seen), and later entries override earlier ones.
     ///
-    /// The first supported real encoding becomes the preferred one. Only Raw
-    /// and Tight are implemented, so other encodings (Hextile, ZRLE, ...) are
-    /// skipped where TurboVNC would use them.
+    /// The first supported real encoding becomes the preferred one. RRE,
+    /// CoRRE, Zlib and ZYWRLE are not implemented and are skipped where
+    /// TurboVNC would use them.
     pub fn apply(&mut self, encodings: &[i32]) {
         let mut preferred = None;
         let without_zlib = self.tight.without_zlib;
@@ -44,7 +45,7 @@ impl EncodingPrefs {
         };
         for &e in encodings {
             match e {
-                ENCODING_RAW | ENCODING_TIGHT => {
+                ENCODING_RAW | ENCODING_HEXTILE | ENCODING_ZRLE | ENCODING_TIGHT => {
                     preferred.get_or_insert(e);
                 }
                 ENCODING_LAST_RECT => self.tight.last_rect = true,
@@ -122,14 +123,18 @@ mod tests {
     fn first_supported_encoding_wins_and_state_resets() {
         let mut p = EncodingPrefs::default();
         p.apply(&[
+            ENCODING_ZYWRLE,
             ENCODING_ZRLE,
             ENCODING_RAW,
             ENCODING_TIGHT,
             ENCODING_TIGHT_WITHOUT_ZLIB,
             ENCODING_QUALITY_LEVEL0 + 9,
         ]);
-        assert_eq!(p.preferred, ENCODING_RAW);
+        // ZYWRLE is not implemented.
+        assert_eq!(p.preferred, ENCODING_ZRLE);
         p.apply(&[ENCODING_HEXTILE]);
+        assert_eq!(p.preferred, ENCODING_HEXTILE);
+        p.apply(&[ENCODING_RRE]);
         assert_eq!(p.preferred, ENCODING_TIGHT);
         assert_eq!(p.tight.quality, None);
         assert!(p.tight.without_zlib, "TightWithoutZlib is sticky");

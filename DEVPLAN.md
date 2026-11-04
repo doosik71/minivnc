@@ -730,18 +730,35 @@ TurboVNC는 X 서버의 `RegionRec`(pixman band 구조)에 크게 의존한다. 
   - 루프백 테스트를 추가했다: 띠 분할 다중 프레임 왕복, JPEG 영역 보고, Interframe(설정·자동·CL), ALR 무손실 복원.
 
 ### M8. 호환성·편의 기능 (3주, P2)
-- [ ] ZRLE, Hextile 인코더/디코더(noVNC, TigerVNC, RealVNC 호환)
-- [ ] WebSocket(같은 포트 자동 감지, RFC 6455, binary/base64, wss), noVNC로 접속 검증
-- [ ] 역방향 연결(서버 `-connect host[:5500]`, 뷰어 리슨 모드), repeater `ID:n`
-- [ ] 뷰어
-  - 스케일링(퍼센트/Auto/FixedRatio), 전체 화면과 다중 모니터 span
-  - 키보드 그랩(Windows `WH_KEYBOARD_LL`. 원본의 `MakeLParam` 버그는 고친다.)
-  - SSH 터널(`-via`, 외부 ssh), 연결 정보 파일, 옵션 저장
-- [ ] `minivnc-session`
-  - Xvfb와 서버 실행, 디스플레이 번호 할당, xauth, xstartup
-  - `-kill`/`-list`, OTP 발급
-- [ ] 스크롤 감지 기반 CopyRect(서버, 실험적)
-- [ ] Windows 서버 백엔드(DXGI Desktop Duplication + SendInput) — 선택
+- [x] ZRLE, Hextile 인코더/디코더(noVNC, TigerVNC, RealVNC 호환)
+  - TurboVNC `hextile.c`, `zrleencodetemplate.c`를 옮겼다. ZRLE는 64x64 타일, zlib 레벨 6, 사각형마다 sync flush, 팔레트 최대 127색, CPIXEL(32비트 픽셀의 색이 위나 아래 3바이트에 들어가면 3바이트)이다.
+  - 디코더는 압축 해제 크기와 타일 범위를 제한한다.
+- [x] WebSocket(같은 포트 자동 감지, RFC 6455, binary/base64, wss)
+  - 연결 뒤 100 ms 동안 첫 바이트를 본다. TLS 핸드셰이크(0x16/0x80)면 wss, `GET `이면 ws, 아무것도 오지 않으면 RFB다.
+  - wss에는 X509 인증서(`-x509cert`)가 필요하다. 하위 프로토콜 `binary`가 없고 `base64`만 있으면 base64로 보낸다.
+  - **noVNC로 접속은 검증하지 못했다**(브라우저 수동 시험 필요).
+- [x] 역방향 연결(서버 `-connect host[:5500][#ID]`, 뷰어 `-listen [PORT]`), repeater `ID:n`(250바이트)
+  - 역방향 연결에는 X509 보안 타입을 내지 않는다(뷰어가 서버 인증서를 받을 수 없다). 공유 정책으로 다른 연결을 끊지 않는다. 보안 설정 `no-reverse-connections`를 따른다.
+- [x] 뷰어
+  - 스케일링(`-Scale` 퍼센트 10~400/Auto/FixedRatio, 최근접 픽셀). 100이 아니면 DesktopSize는 Server다.
+  - 전체 화면과 다중 모니터 span(`-Span` Primary/All/Auto). winit에는 여러 모니터 전체 화면이 없어서, 모니터를 모두 덮는 테두리 없는 창을 쓴다.
+  - 키보드 그랩(`-GrabKeyboard` FS/Always/Manual, Ctrl+Alt+Shift+G). Windows `WH_KEYBOARD_LL`을 쓴다. 원본의 `MakeLParam` 버그는 고쳤다. Linux는 아직 그랩하지 않는다.
+  - SSH 터널(`-via`, 외부 ssh `-N -L`, `MINIVNC_SSH`). 로컬 포트가 열리면 접속한다.
+  - 연결 정보 파일(TurboVNC `.turbovnc`, `-config` 또는 위치 인자), 기본값 `~/.vnc/default.turbovnc`, 옵션 저장(`-SaveConfig`, 비밀번호 제외)
+  - 연결 대화상자(egui) GUI는 다시 미뤘다(사용자 결정).
+- [x] `minivnc-session`(Rust 바이너리, 사용자 결정)
+  - Xvfb와 서버 실행, 디스플레이 번호 할당(TurboVNC `CheckDisplayNumber`), xauth 쿠키, xstartup(`~/.vnc/xstartup.minivnc`, 없으면 만든다)
+  - `-kill`/`-list`, OTP 발급(`-otp`), `-fg`, `-noautokill`, `-rfbauth`, `-- 서버 옵션`
+  - 감독 프로세스가 서버, Xvfb, 앱 중 하나가 끝나거나 신호를 받으면 세션 전체를 정리한다(pid 파일, xauth 항목, 앱 프로세스 그룹).
+  - `scripts/start-minivnc-server.sh`는 `minivnc-session -fg`의 래퍼가 됐다.
+- [ ] 스크롤 감지 기반 CopyRect(서버, 실험적) — 이번 범위에서 뺐다(사용자 결정).
+- [ ] Windows 서버 백엔드(DXGI Desktop Duplication + SendInput) — 선택. 이번 범위에서 뺐다(사용자 결정).
+- **검증 기록 (2026-11-04)**
+  - TurboVNC Xvnc와 MiniVNC 서버에서 ZRLE와 Hextile 스냅숏은 Raw와 픽셀이 같다. Hextile 바이트 수는 TurboVNC와 같고, ZRLE는 0.2~2.4% 크다. TurboVNC Java 뷰어가 MiniVNC 서버의 ZRLE와 Hextile을 그린다.
+  - 루프백 테스트를 추가했다: 전체 업데이트 인코딩 목록에 ZRLE/Hextile, 같은 포트의 WebSocket(binary, base64, wss), 역방향 연결과 repeater ID.
+  - 뷰어 실행 확인(Windows): 1280x720 원격 화면에서 `-Scale=50` 창은 640x360, `-Scale=150` 창은 1920x1080이다.
+  - `minivnc-session`(WSL): 빈 번호 할당, 접속(VNC 인증), 서버 옵션 전달, 앱 종료 시 자동 종료, `-kill`/`-kill :*`, `-fg`에서 Ctrl+C, 비밀번호 파일이 없을 때 오류를 확인했다. 남은 Xvfb, 앱, pid 파일은 없었다.
+  - **검증하지 못한 것**: 브라우저 noVNC 접속, 다중 모니터 span(모니터 하나), 키보드 그랩의 실제 키 가로채기(데스크톱 입력 주입을 하지 않는다), 실제 SSH 게이트웨이를 거친 `-via`, 실제 뷰어의 `-listen`(WSL NAT에서 Windows로 들어오려면 방화벽 규칙이 필요하다), xfce4 xstartup 세션.
 
 ### 일정 요약
 

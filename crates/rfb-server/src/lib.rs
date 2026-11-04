@@ -13,9 +13,11 @@ pub mod security;
 mod session;
 pub mod source;
 mod tls;
+mod websocket;
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak, mpsc};
@@ -27,7 +29,8 @@ use rfb_codec::jpeg::Subsampling;
 use rfb_proto::consts::{EDS_RESULT_PROHIBITED, LED_UNKNOWN};
 use rfb_proto::msg::DEFAULT_MAX_CUT_TEXT;
 use rfb_region::Region;
-use tokio::net::TcpListener;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, broadcast, oneshot};
 use tracing::{error, info, warn};
 
@@ -499,30 +502,52 @@ impl Server {
             let (stream, peer) = listener.accept().await?;
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             info!(client = id, %peer, "connection accepted");
-            if let Err(e) = stream.set_nodelay(true) {
-                warn!(client = id, "set_nodelay: {e}");
-            }
-            let kick = Arc::new(Notify::new());
-            {
-                let mut clients = self.shared.clients();
-                // No other clients: make sure no keys are left pressed.
-                if clients.map.is_empty() {
-                    self.shared.send_input(InputEvent::ReleaseAllKeys);
-                }
-                clients.map.insert(
-                    id,
-                    ClientEntry {
-                        normal: false,
-                        kick: Arc::clone(&kick),
-                    },
-                );
-            }
-            let shared = Arc::clone(&self.shared);
-            tokio::spawn(async move {
-                session::run(stream, peer.ip(), Arc::clone(&shared), id, kick).await;
-                shared.remove(id);
-            });
+            self.spawn_session(stream, peer, id, false);
         }
+    }
+
+    /// Connects to a viewer in listen mode (TurboVNC `vncconnect`):
+    /// `host[:port][#id]`, port 5500 by default. With an id, the server
+    /// first introduces itself to an UltraVNC repeater (Mode II) as `ID:id`.
+    pub async fn connect(&self, target: &str) -> io::Result<()> {
+        let (host, port, id) = parse_reverse_target(target)?;
+        let mut stream = TcpStream::connect((host.as_str(), port)).await?;
+        let peer = stream.peer_addr()?;
+        let client = self.next_id.fetch_add(1, Ordering::Relaxed);
+        info!(client, %peer, "reverse connection made");
+        if let Some(repeater_id) = id {
+            let mut intro = format!("ID:{repeater_id}").into_bytes();
+            intro.resize(250, 0);
+            stream.write_all(&intro).await?;
+        }
+        self.spawn_session(stream, peer, client, true);
+        Ok(())
+    }
+
+    fn spawn_session(&self, stream: TcpStream, peer: SocketAddr, id: u64, reverse: bool) {
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(client = id, "set_nodelay: {e}");
+        }
+        let kick = Arc::new(Notify::new());
+        {
+            let mut clients = self.shared.clients();
+            // No other clients: make sure no keys are left pressed.
+            if clients.map.is_empty() {
+                self.shared.send_input(InputEvent::ReleaseAllKeys);
+            }
+            clients.map.insert(
+                id,
+                ClientEntry {
+                    normal: false,
+                    kick: Arc::clone(&kick),
+                },
+            );
+        }
+        let shared = Arc::clone(&self.shared);
+        tokio::spawn(async move {
+            session::run(stream, peer.ip(), Arc::clone(&shared), id, kick, reverse).await;
+            shared.remove(id);
+        });
     }
 }
 
@@ -565,6 +590,26 @@ fn read_all(source: &mut impl FrameSource) -> io::Result<Framebuffer> {
 }
 
 /// Copies `region` (inside both) from `src` to `dst`.
+/// `host[:port][#id]` as TurboVNC `vncconnect` takes it: port 5500 by
+/// default, an optional UltraVNC repeater id. `[v6]:port` also works.
+fn parse_reverse_target(target: &str) -> io::Result<(String, u16, Option<u32>)> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad target {target}"));
+    let (addr, id) = match target.split_once('#') {
+        Some((a, id)) => (a, Some(id.parse().map_err(|_| bad())?)),
+        None => (target, None),
+    };
+    let (host, port) = match addr.rsplit_once(':') {
+        // An IPv6 address without a port has more than one colon.
+        Some((h, p)) if !h.contains(':') || h.ends_with(']') => (h, p.parse().map_err(|_| bad())?),
+        _ => (addr, 5500),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err(bad());
+    }
+    Ok((host.to_string(), port, id))
+}
+
 fn copy_region(dst: &mut Framebuffer, src: &Framebuffer, region: &Region) {
     for r in region.rects() {
         dst.copy_rect_from(src, source::to_wire_rect(r))
@@ -702,4 +747,24 @@ fn apply(source: &mut impl FrameSource, shared: &Shared, changes: Changes) -> io
         shared.desktop().otp = otp;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_targets() {
+        let t = |s: &str| parse_reverse_target(s).ok();
+        assert_eq!(t("viewer"), Some(("viewer".into(), 5500, None)));
+        assert_eq!(t("viewer:5501"), Some(("viewer".into(), 5501, None)));
+        assert_eq!(
+            t("repeater:5500#1234"),
+            Some(("repeater".into(), 5500, Some(1234)))
+        );
+        assert_eq!(t("[::1]:5502"), Some(("::1".into(), 5502, None)));
+        assert_eq!(t("::1"), Some(("::1".into(), 5500, None)));
+        assert_eq!(t("viewer:x"), None);
+        assert_eq!(t(":5500"), None);
+    }
 }

@@ -16,7 +16,7 @@
 pub mod decoder;
 pub mod encoder;
 mod palette;
-mod zstream;
+pub(crate) mod zstream;
 
 use rfb_proto::PixelFormat;
 

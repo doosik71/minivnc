@@ -11,7 +11,10 @@ use std::path::PathBuf;
 
 use rfb_auth::Password;
 use rfb_codec::tight::TightDecoder;
-use rfb_codec::{CodecError, DecodeError, Framebuffer, copyrect, raw, read_pixel, unpack_rgb};
+use rfb_codec::zrle::ZrleDecoder;
+use rfb_codec::{
+    CodecError, DecodeError, Framebuffer, copyrect, hextile, raw, read_pixel, unpack_rgb,
+};
 use rfb_proto::consts::*;
 use rfb_proto::handshake::{ClientInit, SecurityOffer, SecurityResult, ServerInit, Version};
 pub use rfb_proto::msg::Screen;
@@ -533,6 +536,7 @@ pub struct Client<S> {
     fb: Framebuffer,
     ctx: ServerParseCtx,
     tight: TightDecoder,
+    zrle: ZrleDecoder,
     /// Events decoded but not returned yet: pseudo-rectangles come before
     /// the update they arrived in.
     pending: VecDeque<Event>,
@@ -586,6 +590,7 @@ impl<S: Transport> Client<S> {
             fb: Framebuffer::new(init.width, init.height, init.format),
             ctx: ServerParseCtx::default(),
             tight: TightDecoder::new(),
+            zrle: ZrleDecoder::new(),
             pending: VecDeque::new(),
         })
     }
@@ -692,6 +697,15 @@ impl<S: Read + Write> Client<S> {
                     changed.push(header.rect);
                 }
                 // Only reachable with num_rects == 0xFFFF.
+                ENCODING_HEXTILE => {
+                    hextile::decode(&mut self.conn, header.rect, &mut self.fb)?;
+                    changed.push(header.rect);
+                }
+                ENCODING_ZRLE => {
+                    self.zrle
+                        .decode(&mut self.conn, header.rect, &mut self.fb)?;
+                    changed.push(header.rect);
+                }
                 ENCODING_TIGHT => {
                     self.tight
                         .decode(&mut self.conn, header.rect, &mut self.fb)?;
