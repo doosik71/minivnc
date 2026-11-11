@@ -90,7 +90,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
 
     let full = ask_password()?;
     if !also_view {
-        eprint!("Would you like to enter a view-only password (y/n)? ");
+        eprint!("Would you like to enter a view-only password (y/N)? ");
         let mut answer = String::new();
         io::stdin()
             .read_line(&mut answer)

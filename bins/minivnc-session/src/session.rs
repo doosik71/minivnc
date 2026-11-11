@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -179,6 +179,25 @@ fn program(var: &str, name: &str) -> PathBuf {
     }
 }
 
+/// An error from starting `cmd`, naming the program: a bare "No such file
+/// or directory" does not say what is missing.
+fn cant_run(cmd: &Command, e: io::Error) -> io::Error {
+    let program = cmd.get_program().to_string_lossy();
+    let hint = match e.kind() {
+        io::ErrorKind::NotFound => " (is it installed and on the PATH?)",
+        _ => "",
+    };
+    io::Error::new(e.kind(), format!("can't run {program}: {e}{hint}"))
+}
+
+fn spawn(cmd: &mut Command) -> io::Result<Child> {
+    cmd.spawn().map_err(|e| cant_run(cmd, e))
+}
+
+fn run(cmd: &mut Command) -> io::Result<ExitStatus> {
+    cmd.status().map_err(|e| cant_run(cmd, e))
+}
+
 fn port_free(port: u16) -> bool {
     TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok()
 }
@@ -248,7 +267,10 @@ fn ensure_password(s: &Start) -> io::Result<PathBuf> {
         )));
     }
     eprintln!("\nYou will require a password to access your desktops.\n");
-    let status = Command::new(program("MINIVNC_PASSWD", "minivnc-passwd")).status()?;
+    let status = run(&mut Command::new(program(
+        "MINIVNC_PASSWD",
+        "minivnc-passwd",
+    )))?;
     if !status.success() || !passwd.exists() {
         return Err(io::Error::other("no password was set"));
     }
@@ -304,19 +326,48 @@ fn start(mut s: Start) -> io::Result<()> {
         args.extend(["-supervise".into(), format!(":{n}")]);
     }
     let out = OpenOptions::new().create(true).append(true).open(&log)?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(out.try_clone()?)
-        .stderr(out)
-        .process_group(0)
-        .spawn()?;
-    wait_for("the session", &mut child, || vnc_server_up(n))?;
+    let log_start = out.metadata()?.len();
+    let mut child = spawn(
+        Command::new(std::env::current_exe()?)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(out.try_clone()?)
+            .stderr(out)
+            .process_group(0),
+    )?;
+    // The supervisor's errors, and those of Xvfb and the server, are in
+    // the log, not on this terminal: show what this attempt wrote there.
+    wait_for("the session", &mut child, || vnc_server_up(n))
+        .map_err(|e| io::Error::new(e.kind(), format!("{e}{}", log_tail(&log, log_start))))?;
     announce(&name, n, xstartup.as_deref(), &log);
     if s.otp {
         one_time_password(n)?;
     }
     Ok(())
+}
+
+/// The last lines written to `log` from byte `start` on, to append to an
+/// error message.
+fn log_tail(log: &Path, start: u64) -> String {
+    const LINES: usize = 10;
+    let text = fs::read(log)
+        .ok()
+        .and_then(|b| {
+            b.get(start as usize..)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+        })
+        .unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut tail = format!("\nlog file {}", log.display());
+    if lines.is_empty() {
+        return tail;
+    }
+    tail.push(':');
+    for line in &lines[lines.len().saturating_sub(LINES)..] {
+        tail.push_str("\n  ");
+        tail.push_str(line);
+    }
+    tail
 }
 
 fn announce(name: &str, n: u16, xstartup: Option<&Path>, log: &Path) {
@@ -328,9 +379,13 @@ fn announce(name: &str, n: u16, xstartup: Option<&Path>, log: &Path) {
 }
 
 fn one_time_password(n: u16) -> io::Result<()> {
-    let status = Command::new(program("MINIVNC_PASSWD", "minivnc-passwd"))
-        .args(["-o", "-display", &format!(":{n}")])
-        .status()?;
+    let status = run(
+        Command::new(program("MINIVNC_PASSWD", "minivnc-passwd")).args([
+            "-o",
+            "-display",
+            &format!(":{n}"),
+        ]),
+    )?;
     if !status.success() {
         return Err(io::Error::other("could not set a one-time password"));
     }
@@ -354,10 +409,7 @@ fn xauthority() -> io::Result<PathBuf> {
 }
 
 fn xauth(args: &[&str]) -> io::Result<()> {
-    let status = Command::new("xauth")
-        .args(args)
-        .stdout(Stdio::null())
-        .status()?;
+    let status = run(Command::new("xauth").args(args).stdout(Stdio::null()))?;
     if status.success() {
         Ok(())
     } else {
@@ -412,21 +464,22 @@ fn supervise(s: &Start) -> io::Result<()> {
     let display = format!(":{n}");
 
     let (w, h) = s.geometry;
-    let mut xvfb = Command::new(program("XVFB", "Xvfb"))
-        .args([
-            &display,
-            "-screen",
-            "0",
-            &format!("{w}x{h}x{}", s.depth),
-            "-auth",
-            &auth,
-            "-nolisten",
-            "tcp",
-        ])
-        .stdin(Stdio::null())
-        .stdout(out()?)
-        .stderr(out()?)
-        .spawn()?;
+    let mut xvfb = spawn(
+        Command::new(program("XVFB", "Xvfb"))
+            .args([
+                &display,
+                "-screen",
+                "0",
+                &format!("{w}x{h}x{}", s.depth),
+                "-auth",
+                &auth,
+                "-nolisten",
+                "tcp",
+            ])
+            .stdin(Stdio::null())
+            .stdout(out()?)
+            .stderr(out()?),
+    )?;
     let result = (|| -> io::Result<()> {
         wait_for("Xvfb", &mut xvfb, || x_server_up(n))?;
         let mut server_cmd = Command::new(program("MINIVNC_SERVER", "minivnc-server"));
@@ -443,12 +496,13 @@ fn supervise(s: &Start) -> io::Result<()> {
                 .arg("-x509key")
                 .arg(key);
         }
-        let mut server = server_cmd
-            .args(&s.server_args)
-            .stdin(Stdio::null())
-            .stdout(out()?)
-            .stderr(out()?)
-            .spawn()?;
+        let mut server = spawn(
+            server_cmd
+                .args(&s.server_args)
+                .stdin(Stdio::null())
+                .stdout(out()?)
+                .stderr(out()?),
+        )?;
         let pid_path = pid_file(n)?;
         fs::write(&pid_path, format!("{}\n", server.id()))?;
         let session = (|| -> io::Result<()> {
@@ -457,7 +511,7 @@ fn supervise(s: &Start) -> io::Result<()> {
                 one_time_password(n)?;
             }
             let mut apps = match xstartup_path(s)? {
-                Some(x) => Some(
+                Some(x) => Some(spawn(
                     Command::new("sh")
                         .arg(x)
                         .env("DISPLAY", &display)
@@ -466,9 +520,8 @@ fn supervise(s: &Start) -> io::Result<()> {
                         .stdin(Stdio::null())
                         .stdout(out()?)
                         .stderr(out()?)
-                        .process_group(0)
-                        .spawn()?,
-                ),
+                        .process_group(0),
+                )?),
                 None => None,
             };
             loop {

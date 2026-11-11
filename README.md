@@ -3,6 +3,7 @@
 **MiniVNC**는 고성능 VNC 구현체인 [TurboVNC](https://TurboVNC.org)의 핵심 기능을 **Rust**로 다시 개발하는 프로젝트입니다.
 
 TurboVNC의 강점을 Rust로 옮겨, 메모리 안전하고 배포하기 쉬운 서버와 뷰어를 만드는 것이 목표입니다. 옮길 강점은 다음과 같습니다.
+
 - 고속 Tight + JPEG 인코딩
 - 지연 업데이트와 혼잡 제어
 - 자동 무손실 갱신(ALR)
@@ -67,15 +68,70 @@ minivnc/
 
 ## 빌드
 
-요구 사항:
-- Rust stable (1.88 이상)
-- C 컴파일러: zlib을 소스에서 정적 빌드합니다(Windows는 MSVC, Linux는 gcc/clang).
-- JPEG: Linux에서는 TurboVNC처럼 libjpeg-turbo 3을 씁니다. 크레이트에 든 소스를 정적으로 빌드하므로 CMake와 NASM이 필요합니다(`sudo apt install cmake nasm`; 배포판의 libjpeg-turbo 2.x에는 TurboJPEG 3 API가 없습니다). Windows 기본은 순수 Rust이고, `--features rfb-codec/turbojpeg`로 libjpeg-turbo를 쓸 수 있습니다(CMake와 NASM 필요).
-- Linux X11 서버는 순수 Rust X 프로토콜 구현(x11rb)을 쓰므로 X11 개발 헤더가 필요 없습니다. X 서버에는 MIT-SHM(없으면 느린 GetImage 사용), DAMAGE, XTEST, XKEYBOARD 확장이 있어야 합니다.
+### 선행 조건
+
+빌드 전에 아래 도구와 라이브러리를 설치합니다. `scripts/build-minivnc.sh`와 `scripts/install-minivnc.sh`는 시작할 때 빌드 도구가 있는지 확인하고, 빠진 것을 알려 줍니다(실행에 필요한 패키지는 확인하지 않습니다).
+
+#### 공통: Rust stable 1.88 이상
+
+```sh
+# Linux (rustup, https://rustup.rs)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup update stable
+```
+
+#### Linux 빌드 (Debian/Ubuntu)
+
+| 패키지                     | 용도                                                      |
+| -------------------------- | --------------------------------------------------------- |
+| `build-essential`          | C 컴파일러. zlib과 libjpeg-turbo를 소스에서 정적으로 빌드 |
+| `cmake`, `nasm`            | libjpeg-turbo 3 빌드(SIMD)                                |
+| `pkg-config`, `libssl-dev` | TLS(VeNCrypt)용 시스템 OpenSSL                            |
+| `libpam0g-dev`             | 서버의 Plain/UnixLogin 인증(PAM)                          |
+
+```sh
+sudo apt install build-essential cmake nasm pkg-config libssl-dev libpam0g-dev
+```
+
+#### Linux 실행 (Debian/Ubuntu)
+
+빌드에는 필요 없지만, `minivnc-session`으로 세션을 띄우고 뷰어를 실행하려면 설치해야 합니다.
+
+| 패키지               | 용도                                                                     |
+| -------------------- | ------------------------------------------------------------------------ |
+| `xvfb`               | 세션의 가상 X 서버. 모니터 없이 메모리에 화면을 그린다                   |
+| `xauth`              | 세션 X 디스플레이의 인증 쿠키 등록                                       |
+| `xfce4`, `dbus-x11`  | 기본 데스크톱(`~/.vnc/xstartup.minivnc`). 다른 데스크톱을 쓰면 필요 없음 |
+| `libxkbcommon-x11-0` | 뷰어의 키보드 처리. 데스크톱이 설치된 시스템에는 보통 이미 있음          |
+
+```sh
+sudo apt install xvfb xauth xfce4 dbus-x11 libxkbcommon-x11-0
+```
+
+#### Windows
+
+| 도구                                          | 용도                                                           |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| Visual Studio Build Tools(C++ 워크로드, MSVC) | C 컴파일러와 링커                                              |
+| [Strawberry Perl](https://strawberryperl.com) | OpenSSL 소스 빌드                                              |
+| CMake, NASM                                   | libjpeg-turbo 빌드. NASM이 있으면 OpenSSL도 어셈블리 구현을 씀 |
+
+```bat
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install StrawberryPerl.StrawberryPerl Kitware.CMake NASM.NASM
+```
+
+설치한 뒤 새 터미널을 열어 PATH를 반영합니다.
+
+참고:
+
+- JPEG: Linux에서는 TurboVNC처럼 libjpeg-turbo 3을 씁니다. 크레이트에 든 소스를 정적으로 빌드하므로 CMake와 NASM이 필요합니다. 배포판의 libjpeg-turbo 2.x에는 TurboJPEG 3 API가 없습니다. `cargo build`로 직접 빌드할 때 Windows 기본은 순수 Rust이고, `--features rfb-codec/turbojpeg`로 libjpeg-turbo를 쓸 수 있습니다(CMake와 NASM 필요).
+- Linux X11 서버는 순수 Rust X 프로토콜 구현(x11rb)을 쓰므로 X11 개발 헤더가 필요 없습니다. X 서버에는 MIT-SHM(없으면 느린 GetImage 사용), DAMAGE, XTEST, XKEYBOARD 확장이 있어야 합니다. Xvfb는 이 확장을 모두 제공합니다.
 - 뷰어는 winit + softbuffer로 그리며 빌드에 추가 시스템 패키지가 필요 없습니다. Linux에서는 실행할 때 X11(또는 Wayland)과 libxkbcommon 라이브러리를 불러옵니다.
-- TLS(VeNCrypt)는 OpenSSL을 씁니다.
-  - Linux: 시스템 OpenSSL과 서버의 PAM을 씁니다(Debian/Ubuntu: `sudo apt install libssl-dev pkg-config libpam0g-dev`).
-  - Windows: OpenSSL을 소스에서 정적으로 빌드하므로 Perl이 필요합니다. [Strawberry Perl](https://strawberryperl.com)을 설치하고 Git for Windows의 perl보다 앞에 오게 하세요(또는 `OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe`). NASM이 PATH에 있으면 어셈블리 구현을 씁니다. 빌드 경로가 너무 길면 OpenSSL 구성이 "files missing"으로 실패하니, 짧은 경로(예: `--target-dir C:\t`)를 쓰세요. 링크할 때 나오는 `LNK4099`(PDB 없음) 경고는 무시해도 됩니다.
+- Windows OpenSSL: 소스에서 정적으로 빌드합니다. Strawberry Perl이 Git for Windows의 perl보다 PATH에서 앞에 와야 합니다(또는 `OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe`). 빌드 경로가 너무 길면 OpenSSL 구성이 "files missing"으로 실패하니, 짧은 경로(예: `--target-dir C:\t`)를 쓰세요. 링크할 때 나오는 `LNK4099`(PDB 없음) 경고는 무시해도 됩니다.
+
+### 빌드 명령
 
 ```sh
 cargo build --release
@@ -111,7 +167,7 @@ cargo install --locked --path tools/rfb-bench
 cargo uninstall minivnc-viewer
 ```
 
-`minivnc-session`은 같은 디렉터리의 `minivnc-server`, `minivnc-passwd`를 먼저 찾으므로 함께 설치합니다. Xvfb와 xauth는 시스템 패키지로 설치합니다(Debian/Ubuntu: `sudo apt install xvfb xauth`; 기본 데스크톱은 `xfce4 dbus-x11`).
+`minivnc-session`은 같은 디렉터리의 `minivnc-server`, `minivnc-passwd`를 먼저 찾으므로 함께 설치합니다. Xvfb와 xauth는 시스템 패키지로 설치합니다(위 "선행 조건"의 Linux 실행 항목).
 
 ### 실행
 
