@@ -45,7 +45,7 @@ if [ ${#missing[@]} -gt 0 ]; then
   Debian/Ubuntu: sudo apt install build-essential cmake nasm pkg-config libssl-dev libpam0g-dev"
 fi
 
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -n 1)
+version=$(tr -d '\r' < "$repo/Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1)
 [ -n "$version" ] || fail "no version in $repo/Cargo.toml"
 name=minivnc-$version-linux-$(uname -m)
 bins=(minivnc-server minivnc-session minivnc-passwd minivnc-viewer)
